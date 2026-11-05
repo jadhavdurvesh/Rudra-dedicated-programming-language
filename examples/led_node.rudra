@@ -1,0 +1,39 @@
+// Warning-light node on an ESP32. Takes orders from the main board over serial.
+//   ARM / DISARM   beacon blinks and strobe fades while armed
+//   SIREN <0|1>    siren relay (active low)
+//   PING           keep-alive              (node answers PONG)
+node led_node target esp32 {
+  serial 115200
+
+  const BLINK = 250ms
+
+  output beacon: digital(pin 16, safe false)
+  output strobe: pwm(pin 17, safe 50)
+  output siren:  digital(pin 18, invert, safe false)
+  input  btn:    digital(pin 13, pullup, invert)
+
+  var armed = false
+  var phase = 0
+
+  every BLINK {
+    if armed { beacon = !beacon } else { beacon = false }
+  }
+
+  // triangle fade 0..100..0 on the strobe
+  every 20ms {
+    if armed {
+      phase = (phase + 5) % 200
+      if phase < 100 { strobe = phase } else { strobe = 200 - phase }
+    }
+  }
+
+  on ARM      { armed = true }
+  on DISARM   { armed = false  strobe = 0 }
+  on SIREN(v) { siren = v > 0 }
+
+  when btn { send "BTN" }
+
+  // master silent for 2 s: safe states are applied (strobe 50, siren off), then the
+  // body runs for anything extra: here, the beacon goes on steady.
+  heartbeat 2s { beacon = true }
+}

@@ -1,0 +1,34 @@
+// Drive node for a small rover (Arduino Nano): one DC motor behind an H-bridge.
+//   GO <speed>   drive forward (-80..80)     STOP   stop and go idle
+//   STATE        which state am I in (0 idle, 1 driving, 2 backing)
+//   LOG          dump the black box          PING / WHO / STATUS   built in
+node rover target nano {
+  serial 9600
+  blackbox 16                        // remember the last 16 events (RAM only)
+
+  input  bump:  digital(pin 2, pullup, invert, debounce 30ms)   // ignore contact bounce
+  output drive: motor(pwm 5, dir 4, ramp 200, limit 80, timeout 1s, safe 0)
+  output lamp:  digital(pin 13, safe false)
+
+  // the motor may only run forward while the warning lamp is lit
+  never drive > 0 && lamp == false
+
+  state idle {
+    enter { drive = 0  lamp = false }
+    on GO(speed) { lamp = true  drive = speed  goto driving }
+  }
+
+  state driving {
+    every 400ms { drive = drive }    // keep-alive: the motor stops by itself if we stop writing
+    when bump for 50ms { send "BUMP"  drive = -40  goto backing }
+    on STOP { goto idle }
+  }
+
+  state backing {
+    every 400ms { drive = drive }
+    when true for 1500ms { goto idle }
+    on STOP { goto idle }
+  }
+
+  heartbeat 3s
+}

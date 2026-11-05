@@ -1,0 +1,32 @@
+// Cooling fan node on an Arduino Nano. Takes orders from the main board over serial.
+//   FAN <0..100>   manual fan speed        AUTO   back to thermostat mode
+//   PING           keep-alive              (node answers PONG)
+node fan_nano target nano {
+  serial 9600
+
+  const HOT  = 600      // raw reading 0..1023
+  const COOL = 500
+
+  input  temp:  analog(pin A0)
+  // 'safe' is what the output does at boot AND when the master goes quiet
+  output fan:   pwm(pin 9, safe 100)
+  output alarm: digital(pin 7, safe true)
+
+  var auto = true
+
+  every 1s { send "TEMP", temp }
+
+  // thermostat with hysteresis: fast above HOT, slow below COOL
+  every 100ms {
+    if auto {
+      if temp > HOT { fan = 100 } else if temp < COOL { fan = 20 }
+      alarm = temp > 900
+    }
+  }
+
+  on AUTO   { auto = true }
+  on FAN(v) { auto = false  fan = v }
+
+  // master silent for 3 s: every output goes to its safe state (fan 100, alarm on)
+  heartbeat 3s
+}

@@ -1,0 +1,48 @@
+// Scout-head node on an ESP32: pan servo, 8-pixel status ring and an I2C temperature sensor.
+//   PAN <0..180>      aim the camera head
+//   COLOR <r> <g> <b> whole ring one colour (0..255 each)
+//   DOT <i> <r> <g> <b>  one pixel
+//   ALERT / SCAN / RAINBOW / CALM   ring animations (pulse red, blue chase, rainbow, stop)
+//   SWEEP / HOLD      slow automatic pan on / off
+//   PING              keep-alive               (node answers PONG)
+// Temperature sensor: a TMP102-style chip, register 0 holds a signed 16-bit reading.
+node scout target esp32 {
+  serial 115200
+
+  output head:  servo(pin 25, safe 90)
+  output ring:  neopixel(pin 26, count 8, safe 255, 0, 0)   // red when the master is gone
+  input  temp:  i2c(addr 0x48, reg 0, bytes 2, signed)
+  input  btn:   digital(pin 27, pullup, invert)
+
+  var sweeping = false
+  var angle = 90
+  var dir = 2
+
+  every 50ms {
+    if sweeping {
+      angle = angle + dir
+      if angle >= 170 { dir = -2 }
+      if angle <= 10  { dir = 2 }
+      head = angle
+    }
+  }
+
+  every 2s { send "TEMP", temp }
+  when temp > 3200 { send "HOT" }          // raw units: 0.0625 C per count, 3200 = 200 C. Placeholder threshold
+
+  on PAN(a)         { sweeping = false  head = a }
+  on SWEEP          { sweeping = true }
+  on HOLD           { sweeping = false }
+  on COLOR(r, g, b) { fill ring, r, g, b }
+  on DOT(i, r, g, b) { pixel ring, i, r, g, b }
+
+  // animations run by themselves; a fixed colour (COLOR / DOT) stops them
+  on ALERT   { animate ring, pulse, 255, 0, 0, 800ms }
+  on SCAN    { animate ring, chase, 0, 120, 255, 600ms }
+  on RAINBOW { animate ring, rainbow, 3s }
+  on CALM    { animate ring, off }
+
+  when btn { send "BTN" }
+
+  heartbeat 2s
+}

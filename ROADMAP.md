@@ -1,0 +1,35 @@
+# Rudra roadmap: from node script to a robot language
+
+Model: KUKA KRL and ABB RAPID. Small, strict, readable by a technician, built around what the robot does, and
+**provably bounded**: no surprise stalls, no heap, no recursion. Every stage ends with tests that compare the simulator
+with the compiled output, and an honest README entry. Nothing is "done" until it is tested on a real board.
+
+## Track A: the language
+
+| Stage | What | Exit test |
+|---|---|---|
+| A0 (done, v0.4) | outputs with safe states, interlocks, states, timing words, motors, bus, black box | 101 tests |
+| A1 (done, v0.5) | `func` (pure) / `proc`, typed, non-recursive, `return`, local `let` | recursion is a compile error; sim == C++ (116 tests) |
+| A2 (done, v0.5) | `for i in 0..N` with constant bounds, `break` | a loop can never run unbounded; sim == C++ |
+| A3 (done, v0.7) | fixed-size arrays `int[16]`, `struct`, `enum` | index proved in range or checked at run time and counted; sim == C++ (151 tests) |
+| A4 (done, v0.6) | **worst-case prover**: max run time per handler and per main-loop pass, stack depth, RAM; refuse if over a declared `budget` | model-based; to be calibrated against real boards |
+| A5 | `import` / shared pin maps and interlock sets | two nodes share one definition |
+| A6 | motion words in the KRL/RAPID spirit: `move`, `speed`, `zone`, waypoints for steppers and motors | sequence tables, bounded |
+
+## Track B: the compiler
+
+| Stage | What | Exit test |
+|---|---|---|
+| B1 (done, v0.8) | one typed IR (`rudrac/ir.py`); simulator, C++ backend and prover all read it; `rudrac ir` prints it | one definition of "what the program means"; IR validator; golden-value tests (164 tests) |
+| B2 | bytecode backend + tiny VM for Nano and ESP32; update logic over serial without reflashing | same programs, same results as C++ backend |
+| B3 | formatter, language server (errors in the editor), `rudrac fmt` | |
+| B4 | written spec + conformance test suite | a second implementation could pass it |
+| B5 | direct machine code (AVR, Xtensa/RISC-V); self-hosting | late, optional |
+
+## Order
+
+A1 -> A2 -> A4 (the prover is the reason to exist) -> A3 -> B1 -> B2 -> A5/A6 -> B3/B4 -> B5.
+
+## Rule that does not change
+
+Real-board testing happens in parallel from now on: flash one node per stage and record what differed from the simulator.

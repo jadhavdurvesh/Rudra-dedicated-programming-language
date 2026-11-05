@@ -1,0 +1,18 @@
+// Pan stepper of a sensor turret (ESP32) on a shared RS485 bus.
+// The master addresses it as  @3 AIM 120   (@0 = everybody, nobody answers a broadcast).
+//   AIM <steps>   move to a position     HOME   go back to 0     WHERE   answer AT <position>
+node turret target esp32 {
+  serial 115200
+  address 3
+  rs485 pin 4                        // driver-enable pin of the RS485 transceiver
+
+  input  home_sw: digital(pin 14, pullup, invert, debounce 10ms)
+  output pan:     stepper(step 25, dir 26, rate 200, safe 0)   // safe = drive back to position 0
+
+  on AIM(p) { pan = p }
+  on HOME   { pan = 0 }
+  on WHERE  { send "AT", pan }
+  on SWITCH { send "SW", home_sw }
+
+  heartbeat 5s
+}

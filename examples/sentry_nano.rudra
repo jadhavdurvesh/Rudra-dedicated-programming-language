@@ -1,0 +1,18 @@
+// Proximity sentry (Arduino Nano): an HC-SR04 ultrasonic sensor and a buzzer.
+//   GET         answer DIST <cm> (0 = nothing in range)     BEEP <hz>   test the buzzer (0 = off)
+// Something closer than 30 cm for 200 ms sounds the horn; it stops when the way is clear again.
+node sentry target nano {
+  serial 9600
+
+  input  sonar: ultrasonic(trig 7, echo 8)      // measured every 60 ms, in centimetres
+  output horn:  tone(pin 6, safe off)           // value = frequency in Hz, 0 = silent
+  output lamp:  digital(pin 13, safe false)
+
+  when sonar > 0 && sonar < 30 for 200ms { horn = 880  lamp = true }
+  when sonar == 0 || sonar >= 50         { horn = 0    lamp = false }
+
+  on GET     { send "DIST", sonar }
+  on BEEP(f) { horn = f }
+
+  heartbeat 3s
+}

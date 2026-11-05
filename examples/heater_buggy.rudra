@@ -1,0 +1,26 @@
+// Deliberately buggy copy of heater_nano.rudra, to show what `rudrac verify` finds.
+// Heater + fan on an Arduino Nano. The rule: the heater must NEVER run while the fan is off.
+//   FAN <0|1>   fan on/off      PING / WHO / STATUS   built in
+node heater_buggy target nano {
+  serial 9600
+
+  const TARGET = 500                        // raw temperature reading 0..1023
+
+  input  temp:   analog(pin A0)
+  output heater: digital(pin 4, safe false)
+  output fan:    digital(pin 5, safe true)
+
+  // The interlock. The compiler proves the safe state obeys it, and every write is checked against it.
+  never heater and not fan
+
+  // heat only while the fan is running
+  every 500ms {
+    if temp < TARGET and fan { heater = true } else { heater = false }
+  }
+
+  // BUG on purpose: switching the fan off while the heater is on breaks the rule
+  on FAN(v) { fan = v > 0 }
+
+  every 2s { send "TEMP", temp }
+  heartbeat 3s
+}
