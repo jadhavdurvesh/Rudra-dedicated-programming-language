@@ -1,0 +1,14 @@
+node t target nano {
+
+  var total = 0
+  func sq(x: int) -> int { return x * x }
+  func clamp(x: int, lo: int, hi: int) -> int { if x < lo { return lo } if x > hi { return hi } return x }
+  proc add(n: int) { total = total + n }
+  on SUM(n) {
+    total = 0
+    let m = clamp(n, 0, 10)
+    for i in 0..10 { if i >= m { break } add(sq(i)) }
+    send "S", total
+  }
+  heartbeat 100s
+}

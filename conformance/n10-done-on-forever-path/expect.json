@@ -1,0 +1,9 @@
+{
+ "errors": [
+  {
+   "line": 6,
+   "level": "error",
+   "contains": "path 'p' never finishes (forever), so 'd"
+  }
+ ]
+}

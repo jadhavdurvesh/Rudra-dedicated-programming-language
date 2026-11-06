@@ -1,0 +1,10 @@
+import "lib.rudra"
+node t target nano {
+
+  output heater: digital(pin 6, safe false)
+  output fan: digital(pin 5, safe true)
+  on SET(v) { send "V", clamp(v, 0, LIMIT) }
+  on HEAT { heater = true }
+  on FANOFF { fan = false }
+  heartbeat 100s
+}

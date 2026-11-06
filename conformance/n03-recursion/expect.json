@@ -1,0 +1,9 @@
+{
+ "errors": [
+  {
+   "line": 3,
+   "level": "error",
+   "contains": "'f' calls itself (f -> f): recursion is "
+  }
+ ]
+}

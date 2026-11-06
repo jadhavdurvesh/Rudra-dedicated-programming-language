@@ -1,0 +1,1 @@
+{"run_ms": 4000, "events": [[100, "rx", "FANOFF"], [200, "rx", "LIGHT"], [300, "rx", "LOG"]]}

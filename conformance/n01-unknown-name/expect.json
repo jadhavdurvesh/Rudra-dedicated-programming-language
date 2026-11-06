@@ -1,0 +1,14 @@
+{
+ "errors": [
+  {
+   "line": 3,
+   "level": "error",
+   "contains": "unknown name 'lamp'"
+  },
+  {
+   "line": 2,
+   "level": "warning",
+   "contains": "output 'led' is never set (it stays at i"
+  }
+ ]
+}

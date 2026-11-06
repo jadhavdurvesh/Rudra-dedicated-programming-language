@@ -1,0 +1,9 @@
+{
+ "errors": [
+  {
+   "line": 3,
+   "level": "error",
+   "contains": "a func only computes a value, it cannot "
+  }
+ ]
+}

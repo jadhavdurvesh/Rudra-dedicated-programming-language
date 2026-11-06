@@ -1,0 +1,14 @@
+{
+ "errors": [
+  {
+   "line": 3,
+   "level": "warning",
+   "contains": "never read"
+  },
+  {
+   "line": 2,
+   "level": "error",
+   "contains": "the main loop can take up to"
+  }
+ ]
+}

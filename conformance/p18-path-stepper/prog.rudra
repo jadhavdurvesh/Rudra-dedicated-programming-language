@@ -1,0 +1,14 @@
+node t target esp32 {
+  output pan: stepper(step 25, dir 26, rate 200, safe 0)
+  path sweep for pan {
+    at 20 speed 500 zone 2
+    at 5 speed 100 wait 300
+    at 0
+    repeat 2
+  }
+  on GO { run sweep }
+  on HALT { stop pan }
+  on Q { send "R", sweep  send "P", pan }
+  done sweep { send "DONE" }
+  heartbeat 100s
+}

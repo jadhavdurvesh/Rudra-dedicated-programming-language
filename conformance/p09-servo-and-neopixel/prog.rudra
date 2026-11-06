@@ -1,0 +1,8 @@
+node t target esp32 {
+  output head: servo(pin 25, safe 90)
+  output ring: neopixel(pin 26, count 4, safe 255, 0, 0)
+  on PAN(a) { head = a }
+  on COL(r, g, b) { fill ring, r, g, b }
+  on DOT(i, r, g, b) { pixel ring, i, r, g, b }
+  heartbeat 2s
+}

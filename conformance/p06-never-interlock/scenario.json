@@ -1,0 +1,1 @@
+{"run_ms": 2000, "events": [[100, "rx", "FANOFF"], [200, "rx", "HEAT"], [300, "rx", "STATUS"], [400, "rx", "FANON"], [500, "rx", "HEAT"], [600, "rx", "FANOFF"], [700, "rx", "STATUS"], [800, "rx", "READ"]]}

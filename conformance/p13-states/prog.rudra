@@ -1,0 +1,14 @@
+node t target nano {
+
+  output lamp: digital(pin 13, safe false)
+  state idle {
+    enter { lamp = false  send "IDLE" }
+    on GO { goto busy }
+  }
+  state busy {
+    enter { lamp = true  send "BUSY" }
+    when true for 500ms { goto idle }
+    on STOP { goto idle }
+  }
+  heartbeat 100s
+}

@@ -1,0 +1,8 @@
+node t target nano {
+
+  input btn: digital(pin 2, pullup, invert, debounce 30ms)
+  output led: digital(pin 5, safe false)
+  when btn for 200ms { led = true  send "HELD" }
+  when not btn { led = false }
+  heartbeat 100s
+}

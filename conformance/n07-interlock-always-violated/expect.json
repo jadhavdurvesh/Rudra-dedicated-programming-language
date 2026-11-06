@@ -1,0 +1,14 @@
+{
+ "errors": [
+  {
+   "line": 4,
+   "level": "error",
+   "contains": "the safe state itself breaks this rule: "
+  },
+  {
+   "line": 2,
+   "level": "warning",
+   "contains": "output 'a' is never set (it stays at its"
+  }
+ ]
+}

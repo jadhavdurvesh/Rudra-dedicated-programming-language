@@ -1,0 +1,6 @@
+node t target esp32 {
+  output ring: neopixel(pin 26, count 4, safe 0, 0, 0)
+  on BLINK { animate ring, blink, 255, 0, 0, 400ms }
+  on OFF { animate ring, off }
+  heartbeat 100s
+}

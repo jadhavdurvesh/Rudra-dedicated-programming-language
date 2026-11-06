@@ -1,0 +1,6 @@
+node t target nano {
+  var a: int[4]
+  output led: digital(pin 5, safe false)
+  on X { a[9] = 1  led = true }
+  heartbeat 3s
+}

@@ -1,0 +1,11 @@
+node t target nano {
+
+  output drive: motor(pwm 5, dir 4, safe 0)
+  path pulse for drive { at 60 wait 300
+ at -40 wait 100
+ repeat 2 }
+  on GO { run pulse }
+  on STOP { stop drive }
+  done pulse { send "DONE" }
+  heartbeat 100s
+}

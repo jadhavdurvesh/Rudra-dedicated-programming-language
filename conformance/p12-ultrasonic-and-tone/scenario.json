@@ -1,0 +1,1 @@
+{"run_ms": 2000, "events": [[100, "set", "sonar", 20], [400, "rx", "GET"], [900, "set", "sonar", 80], [1200, "rx", "GET"]]}

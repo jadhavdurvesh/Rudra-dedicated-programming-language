@@ -1,0 +1,1 @@
+{"run_ms": 3000, "events": [[0, "set", "temp", 400], [700, "fail", "temp", true], [1200, "set", "temp", 500], [1800, "fail", "temp", false], [2100, "set", "temp", -20]]}

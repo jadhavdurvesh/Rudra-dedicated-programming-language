@@ -1,0 +1,4 @@
+node t target nano {
+  output led: digital(pin 5)
+  heartbeat 3s
+}

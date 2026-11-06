@@ -1,0 +1,6 @@
+node t target esp32 {
+  output pan: stepper(step 25, dir 26, rate 200, safe 0)
+  path p for pan { at 5 speed 5000 }
+  on X { run p }
+  heartbeat 3s
+}

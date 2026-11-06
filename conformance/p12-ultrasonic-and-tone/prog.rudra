@@ -1,0 +1,9 @@
+node t target nano {
+
+  input sonar: ultrasonic(trig 7, echo 8)
+  output horn: tone(pin 6, safe off)
+  when sonar > 0 && sonar < 30 { horn = 440 }
+  when sonar == 0 || sonar >= 30 { horn = 0 }
+  on GET { send "D", sonar }
+  heartbeat 100s
+}

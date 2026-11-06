@@ -1,0 +1,14 @@
+{
+ "errors": [
+  {
+   "line": 2,
+   "level": "error",
+   "contains": "output 'led' needs a safe state"
+  },
+  {
+   "line": 2,
+   "level": "warning",
+   "contains": "output 'led' is never set (it stays at i"
+  }
+ ]
+}

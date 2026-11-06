@@ -1,0 +1,9 @@
+{
+ "errors": [
+  {
+   "line": 4,
+   "level": "error",
+   "contains": "index 9 is outside the array (valid: 0.."
+  }
+ ]
+}

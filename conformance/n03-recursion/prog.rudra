@@ -1,0 +1,6 @@
+node t target nano {
+  output led: digital(pin 5, safe false)
+  func f(n: int) -> int { return f(n) }
+  on X { led = f(1) > 0 }
+  heartbeat 3s
+}

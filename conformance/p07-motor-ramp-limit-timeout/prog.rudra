@@ -1,0 +1,6 @@
+node t target nano {
+
+  output drive: motor(pwm 5, dir 4, ramp 200, limit 80, timeout 1s, safe 0)
+  on GO(v) { drive = v }
+  heartbeat 100s
+}

@@ -1,0 +1,8 @@
+node t target nano {
+
+  input temp: analog(pin A0)
+  output fan: pwm(pin 9, safe 100)
+  every 500ms { send "T", temp }
+  every 100ms { if temp > 600 { fan = 100 } else { fan = 20 } }
+  heartbeat 100s
+}

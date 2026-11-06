@@ -1,0 +1,1 @@
+{"run_ms": 1500, "events": [[100, "rx", "PING"], [300, "rx", "STATUS"], [400, "rx", "NOPE"], [500, "rx", "X 1 2"]]}

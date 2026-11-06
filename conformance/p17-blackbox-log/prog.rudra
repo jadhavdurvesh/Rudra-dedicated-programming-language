@@ -1,0 +1,10 @@
+node t target nano {
+
+  blackbox 8
+  output lamp: digital(pin 13, safe false)
+  output fan: digital(pin 5, safe true)
+  never lamp and not fan
+  on LIGHT { lamp = true }
+  on FANOFF { fan = false }
+  heartbeat 1s
+}

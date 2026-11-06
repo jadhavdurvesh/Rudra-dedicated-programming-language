@@ -1,0 +1,12 @@
+node t target nano {
+
+  on MATH(a, b) {
+    send "ADD", a + b
+    send "SUB", a - b
+    send "MUL", a * b
+    send "DIV", a / b
+    send "MOD", a % b
+    send "NEG", -a
+  }
+  heartbeat 100s
+}

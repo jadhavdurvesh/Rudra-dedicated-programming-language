@@ -1,0 +1,7 @@
+node t target nano {
+  budget 1ms
+  input t: ultrasonic(trig 7, echo 8)
+  output a: digital(pin 5, safe false)
+  on X { a = true }
+  heartbeat 3s
+}

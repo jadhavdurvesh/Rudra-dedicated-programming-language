@@ -1,0 +1,5 @@
+node t target esp32 {
+  input temp: i2c(addr 0x48, reg 0, bytes 2, signed)
+  every 500ms { send "T", temp }
+  heartbeat 100s
+}

@@ -1,0 +1,5 @@
+node t target nano {
+  output a: digital(pin 5, safe false)
+  on X { a = }
+  heartbeat 3s
+}

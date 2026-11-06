@@ -1,0 +1,7 @@
+node t target nano {
+
+  output led: digital(pin 5, safe false)
+  output fan: pwm(pin 9, safe 100)
+  on ON { led = true  fan = 20 }
+  heartbeat 1s
+}

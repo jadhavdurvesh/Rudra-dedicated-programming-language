@@ -1,0 +1,9 @@
+{
+ "errors": [
+  {
+   "line": 3,
+   "level": "error",
+   "contains": "a stepper speed is 1..1000 steps per sec"
+  }
+ ]
+}

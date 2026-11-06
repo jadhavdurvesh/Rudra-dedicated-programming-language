@@ -1,0 +1,14 @@
+node t target nano {
+
+  enum Mode { idle, scan, fire }
+  struct Point { x: int, y: int, hot: bool }
+  var mode: Mode = Mode.idle
+  var buf: int[4]
+  var pts: Point[2]
+  on SET(i, v) { buf[i] = v }
+  on GET(i) { send "B", buf[i] }
+  on P(i, a) { pts[i].x = a  pts[i].hot = a > 5 }
+  on Q(i) { send "X", pts[i].x  if pts[i].hot { send "HOT" } }
+  on M { if mode == Mode.idle { mode = Mode.scan } else { mode = Mode.fire }  send "M", mode }
+  heartbeat 100s
+}

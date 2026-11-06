@@ -1,0 +1,6 @@
+node t target esp32 {
+  output pan: stepper(step 25, dir 26, rate 200, safe 0)
+  on AIM(p) { pan = p }
+  on Q { send "P", pan }
+  heartbeat 100s
+}

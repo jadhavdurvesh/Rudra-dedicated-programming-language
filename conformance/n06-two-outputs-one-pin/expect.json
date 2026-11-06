@@ -1,0 +1,9 @@
+{
+ "errors": [
+  {
+   "line": 3,
+   "level": "error",
+   "contains": "pin 5 is already used by 'a'"
+  }
+ ]
+}
