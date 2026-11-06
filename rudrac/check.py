@@ -6,13 +6,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from .syntax import (Animate, Assign, AssignTo, Bin, BoolLit, Break, Call, CallStmt, Const, Event, Fill, Fn, For, Goto,
+from .syntax import (Animate, Assign, AssignTo, Bin, RunPath, StopOut, BoolLit, Break, Call, CallStmt, Const, Event, Fill, Fn, For, Goto,
                      If, IO, Index, Let, Member, Name, Never, Node, Num, Pixel, Return, Send, Unary, Var,
                      fmt_expr, has_call, has_place, walk_names, walk_stmts)
-from .util import (ANIM_MAX_PERIOD, ANIM_MIN_PERIOD, ANIM_MODES, Diag, I2C_PINS, RudraError,
+from .util import (LINE_STRIDE, ANIM_MAX_PERIOD, ANIM_MIN_PERIOD, ANIM_MODES, Diag, I2C_PINS, RudraError,
                    TARGETS, resolve_pin, rt_div, rt_mod, wrap32)
 
-RESERVED_COMMANDS = {"PING", "WHO", "STATUS", "STATE", "LOG"}
+RESERVED_COMMANDS = {"PING", "WHO", "STATUS", "STATE", "LOG", "IMG", "IMGEND", "IMGRESET", "IMGINFO"}
 RESERVED_MESSAGES = {"PONG", "ERR", "PING", "WHO", "STATUS", "STATE", "LOG", "LOGEND"}
 WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -206,6 +206,68 @@ class Checker:
         return v
 
     # -- declarations
+    def check_paths(self):
+        """Waypoint tables: every number is a constant here, so the prover can bound them."""
+        for p in self.node.paths:
+            if not self.declare(p.name, Sym("path", "bool", p, False), p.pos):
+                continue
+            sym = self.syms.get(p.out)
+            io = sym.node if sym is not None and sym.kind == "output" else None
+            if io is None or io.kind not in ("stepper", "motor"):
+                self.err(f"a path drives a stepper or a motor output, and '{p.out}' is not one", p.out_pos,
+                         "e.g.  output pan: stepper(step 8, dir 9, rate 400, safe 0)")
+                continue
+            p.kind = io.kind
+            self.writes.add(p.out)
+            if not 1 <= len(p.points) <= 64:
+                self.err("a path needs between 1 and 64 'at' lines", p.pos)
+            if not 1 <= p.repeat <= 1000:
+                self.err("'repeat' must be between 1 and 1000", p.rep_pos or p.pos, "use 'forever' for an endless path")
+            for pt in p.points:
+                v, t = self.const_value(pt.value)
+                if t is not None and t != "int":
+                    self.err("a waypoint value must be a number", pt.pos)
+                elif t is not None:
+                    pt.v = v
+                    if io.kind == "motor" and not -100 <= v <= 100:
+                        self.err("a motor waypoint is a speed from -100 to 100", pt.pos)
+                    if io.kind == "stepper" and abs(v) > 1_000_000_000:
+                        self.err("a stepper position must be within +-1000000000 steps", pt.pos)
+                for label, ex in (("speed", pt.speed), ("zone", pt.zone), ("wait", pt.wait)):
+                    if ex is None:
+                        continue
+                    if io.kind == "motor" and label != "wait":
+                        self.err(f"'{label}' only applies to steppers", pt.pos,
+                                 "a motor waypoint is  at <speed>  with an optional  wait <time>")
+                        continue
+                    n, tt = self.const_value(ex)
+                    if tt is None:
+                        continue
+                    if tt != "int":
+                        self.err(f"'{label}' must be a number", pt.pos)
+                    elif label == "speed":
+                        if not 1 <= n <= 1000:
+                            self.err("a stepper speed is 1..1000 steps per second", pt.pos)
+                        else:
+                            pt.sp = n
+                    elif label == "zone":
+                        if not 0 <= n <= 10000:
+                            self.err("a zone is 0..10000 steps", pt.pos)
+                        else:
+                            pt.zn = n
+                    else:
+                        if not 0 <= n <= 3_600_000:
+                            self.err("a wait is 0..3600000 ms (one hour)", pt.pos)
+                        else:
+                            pt.wt = n
+
+    def pin_name(self, text):
+        """A pin may be named by a const (e.g. one from a shared pin map): const FAN_PIN = 6  ->  pin FAN_PIN."""
+        sym = self.syms.get(text) if isinstance(text, str) else None
+        if sym is not None and sym.kind == "const" and isinstance(sym.value, int) and not isinstance(sym.value, bool):
+            return str(sym.value)
+        return text
+
     def declare(self, name, sym, pos):
         if name in self.enums or name in self.structs:
             self.err(f"'{name}' is already declared as a type", pos)
@@ -315,7 +377,7 @@ class Checker:
 
         pin = None
         if d.pin_text is not None and d.kind != "i2c" and self.node.target in TARGETS:
-            pin, why = resolve_pin(self.node.target, d.pin_text)
+            pin, why = resolve_pin(self.node.target, self.pin_name(d.pin_text))
             if why:
                 self.err(why, d.pin_pos)
         if pin is not None:
@@ -476,7 +538,7 @@ class Checker:
                 if role not in d.pins:
                     continue
                 text, pos = d.pins[role]
-                pin, why = resolve_pin(self.node.target, text)
+                pin, why = resolve_pin(self.node.target, self.pin_name(text))
                 if why:
                     self.err(why, pos)
                     continue
@@ -760,6 +822,23 @@ class Checker:
             if isinstance(s, (Return, Break)) and idx != len(body) - 1:
                 self.err("this statement can never run: "
                          f"'{'return' if isinstance(s, Return) else 'break'}' ends the block", body[idx + 1].pos)
+            if isinstance(s, RunPath):
+                sym = self.syms.get(s.name)
+                if sym is None or sym.kind != "path":
+                    m = difflib.get_close_matches(s.name, [n for n, y in self.syms.items() if y.kind == "path"], n=1)
+                    self.err(f"'{s.name}' is not a path", s.pos, f"did you mean '{m[0]}'?" if m else "declare it with  path NAME for OUTPUT { at ... }")
+                if evkind == "func":
+                    self.err("a func only computes a value, it cannot start a path", s.pos, "use a proc for that")
+                continue
+            if isinstance(s, StopOut):
+                sym = self.syms.get(s.out)
+                if sym is None or sym.kind != "output" or sym.node.kind not in ("stepper", "motor"):
+                    self.err(f"'stop' needs a stepper or motor output, and '{s.out}' is not one", s.pos)
+                else:
+                    self.writes.add(s.out)
+                if evkind == "func":
+                    self.err("a func only computes a value, it cannot stop a motor", s.pos, "use a proc for that")
+                continue
             if evkind == "func" and isinstance(s, (Send, Fill, Pixel, Animate, Goto)):
                 self.err("a func only computes a value, it cannot send, change a strip or change state", s.pos,
                          "use a proc for that")
@@ -1021,7 +1100,7 @@ class Checker:
             if node.address is None:
                 self.err("'rs485' needs an 'address' (it only makes sense on a shared bus)", node.rs485_pos)
             if node.target in TARGETS:
-                pin, why = resolve_pin(node.target, node.rs485_text)
+                pin, why = resolve_pin(node.target, self.pin_name(node.rs485_text))
                 if why:
                     self.err(why, node.rs485_pos)
                 elif not pin.dout:
@@ -1058,6 +1137,7 @@ class Checker:
             else:
                 self.decl_io(d)
 
+        self.check_paths()
         self.check_fns()
 
         for d in node.decls:
@@ -1094,6 +1174,15 @@ class Checker:
                             self.err("duration must be between 1ms and 1000000000ms", ev.pos)
                         else:
                             ev.dur_ms = v
+            elif ev.kind == "done":
+                sym = self.syms.get(ev.name)
+                if sym is None or sym.kind != "path":
+                    self.err(f"'{ev.name}' is not a path", ev.pos)
+                elif sym.node.forever:
+                    self.err(f"path '{ev.name}' never finishes (forever), so 'done {ev.name}' can never run", ev.pos)
+                elif sum(1 for e in node.events if e.kind == "done" and e.name == ev.name) > 1 and singles.get("done:" + ev.name):
+                    self.err(f"path '{ev.name}' has two 'done' blocks", ev.pos)
+                singles["done:" + str(ev.name)] = ev
             elif ev.kind == "on":
                 if ev.name in RESERVED_COMMANDS:
                     self.err(f"'{ev.name}' is built in", ev.pos)
@@ -1132,7 +1221,8 @@ class Checker:
 
         for n, f in self.fns.items():
             if n not in self.called:
-                self.warn(f"{f.kind} '{n}' is never used", f.pos)
+                if f.pos[0] < LINE_STRIDE:           # functions of imported libraries are allowed to go unused
+                    self.warn(f"{f.kind} '{n}' is never used", f.pos)
 
         # ---- state graph
         if node.states and all(n in self.state_index for _, (n, _p) in enumerate(node.states)):

@@ -1,17 +1,19 @@
 """Lexer, AST and parser for the Rudra language."""
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-from .util import Diag, RudraError
+from .util import LINE_STRIDE, Diag, RudraError
 
 KEYWORDS = {
     "node", "target", "const", "input", "output", "var", "every", "when", "on",
     "heartbeat", "start", "if", "else", "send", "serial", "true", "false",
     "pin", "pullup", "invert", "digital", "pwm", "analog", "never",
     "state", "enter", "exit", "goto", "for", "address", "rs485", "blackbox",
-    "func", "proc", "let", "return", "break", "in", "budget", "enum", "struct",
+    "func", "proc", "let", "return", "break", "in", "budget", "enum", "struct", "import",
 }
 WORD_OPS = {"and": "&&", "or": "||", "not": "!"}
 
@@ -32,9 +34,9 @@ class Tok:
     col: int
 
 
-def lex(src: str) -> List[Tok]:
+def lex(src: str, line0: int = 0) -> List[Tok]:
     toks: List[Tok] = []
-    i, n, line, col = 0, len(src), 1, 1
+    i, n, line, col = 0, len(src), 1 + line0, 1
     two = {"==", "!=", "<=", ">=", "&&", "||", "..", "->"}
     one = set("{}(),:=<>+-*/%![].")
     while i < n:
@@ -431,6 +433,43 @@ class IO:
 
 
 @dataclass
+class PathPt:
+    value: Any
+    speed: Optional[Any]
+    zone: Optional[Any]
+    wait: Optional[Any]     # expression: duration in ms
+    pos: Pos
+    v: int = 0              # the checker fills these with constants
+    sp: Optional[int] = None
+    zn: int = 0
+    wt: int = 0
+
+
+@dataclass
+class PathDecl:
+    name: str
+    out: str
+    points: list
+    repeat: int
+    forever: bool
+    pos: Pos
+    out_pos: Pos
+    rep_pos: Optional[Pos] = None
+
+
+@dataclass
+class RunPath:
+    name: str
+    pos: Pos
+
+
+@dataclass
+class StopOut:
+    out: str
+    pos: Pos
+
+
+@dataclass
 class Event:
     kind: str           # every | when | on | heartbeat | start | enter | exit
     arg: Optional[Any]  # period / condition expression
@@ -468,15 +507,52 @@ class Node:
     structs: list = field(default_factory=list)
     budget_ms: Optional[int] = None              # 'budget 5ms': longest allowed main-loop pass
     budget_pos: Optional[Pos] = None
+    paths: list = field(default_factory=list)    # PathDecl in source order
 
 
 # --------------------------------------------------------------------------
 # Parser
 # --------------------------------------------------------------------------
+LIBRARY_ITEMS = ("const", "enum", "struct", "func", "proc", "never")
+
+
+class ImportCtx:
+    """Reads imported library files. Every file gets a number; its tokens carry  number * LINE_STRIDE + line."""
+
+    def __init__(self, path, sources):
+        self.sources = sources if sources is not None else {}
+        self.sources.setdefault(0, (path, ""))
+        self.loaded = {os.path.abspath(path)} if path and path != "<input>" else set()
+        self.stack = [os.path.abspath(path)] if path and path != "<input>" else []
+
+    def include(self, rel: str, tok: Tok, node, from_path: str):
+        base = os.path.dirname(os.path.abspath(from_path)) if from_path and from_path != "<input>" else os.getcwd()
+        full = os.path.normpath(os.path.join(base, rel))
+        if full in self.stack:
+            _err(f"import cycle: {' -> '.join(os.path.basename(p) for p in self.stack + [full])}", tok.line, tok.col)
+        if full in self.loaded:
+            return                                  # already pulled in by another import
+        try:
+            with open(full, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            _err(f"cannot import '{rel}': {e.strerror or e}", tok.line, tok.col,
+                 "the path is relative to the file that contains the import")
+        self.loaded.add(full)
+        fid = len(self.sources)
+        self.sources[fid] = (full, text)
+        self.stack.append(full)
+        Parser(lex(text, fid * LINE_STRIDE), self, full).library(node)
+        self.stack.pop()
+
+
 class Parser:
-    def __init__(self, toks):
+    def __init__(self, toks, ctx=None, path="<input>"):
         self.t = toks
         self.i = 0
+        self.ctx = ctx
+        self.path = path
+        self.pending = []           # imports seen before 'node'
 
     # -- token helpers
     def peek(self, k=0) -> Tok:
@@ -519,12 +595,12 @@ class Parser:
         found = "end of file" if t.kind == "eof" else f"'{t.text}'"
         self.fail(f"expected '{s}' but found {found}{ctx}", t)
 
-    def expect_kw(self, s):
+    def expect_kw(self, s, hint=""):
         t = self.peek()
         if t.kind == "kw" and t.text == s:
             return self.next()
         found = "end of file" if t.kind == "eof" else f"'{t.text}'"
-        self.fail(f"expected '{s}' but found {found}", t)
+        self.fail(f"expected '{s}' but found {found}{hint}", t)
 
     def expect_name(self, what="a name") -> Tok:
         t = self.peek()
@@ -536,7 +612,35 @@ class Parser:
         self.fail(f"expected {what} but found {found}", t)
 
     # -- structure
+    def imports(self):
+        while self.peek().kind == "kw" and self.peek().text == "import":
+            it = self.next()
+            st = self.peek()
+            if st.kind != "str":
+                self.fail('expected a file name in quotes after import, e.g.  import "common.rudra"', st)
+            self.next()
+            self.pending.append((st.value, it))
+
+    def flush_imports(self, node):
+        for rel, tok in self.pending:
+            if self.ctx is None:
+                self.ctx = ImportCtx(self.path, None)
+            self.ctx.include(rel, tok, node, self.path)
+        self.pending = []
+
+    def library(self, node):
+        """A library file: shared consts, enums, structs, funcs, procs and 'never' rules; no node, no hardware."""
+        self.imports()
+        self.flush_imports(node)
+        while self.peek().kind != "eof":
+            t = self.peek()
+            if t.kind != "kw" or t.text not in LIBRARY_ITEMS:
+                self.fail("a library file may only contain const, enum, struct, func, proc and never rules", t,
+                          "pins, variables, handlers and the node itself belong in the node's own file")
+            self.item(node)
+
     def program(self) -> Node:
+        self.imports()
         start = self.expect_kw("node")
         name = self.expect_name("a node name")
         self.expect_kw("target")
@@ -545,6 +649,7 @@ class Parser:
             self.fail("expected a board name after 'target' (nano, uno, esp32, esp32s3)", tt)
         self.next()
         node = Node(name.text, tt.text, (tt.line, tt.col), (start.line, start.col))
+        self.flush_imports(node)
         self.expect_sym("{")
         while not self.at_sym("}"):
             if self.peek().kind == "eof":
@@ -555,8 +660,60 @@ class Parser:
             self.fail("unexpected text after the node's closing '}' (one node per file)")
         return node
 
+    def path_decl(self, node: Node):
+        t = self.next()                                  # 'path'
+        pos = (t.line, t.col)
+        nm = self.expect_name("a path name")
+        self.expect_kw("for", " (a path looks like  path sweep for pan { at 400  at 0 })")
+        ot = self.expect_name("a stepper or motor output name")
+        self.expect_sym("{")
+        pts, repeat, forever, rep_pos = [], 1, False, None
+        while not self.at_sym("}"):
+            k = self.peek()
+            if k.kind == "eof":
+                self.fail("missing '}' at the end of the path")
+            if k.kind == "ident" and k.text == "at":
+                self.next()
+                value = self.expr()
+                speed = zone = wait = None
+                seen = set()
+                while self.peek().kind == "ident" and self.peek().text in ("speed", "zone", "wait"):
+                    o = self.next()
+                    if o.text in seen:
+                        self.fail(f"option '{o.text}' is given twice", o)
+                    seen.add(o.text)
+                    if o.text == "speed":
+                        speed = self.expr()
+                    elif o.text == "zone":
+                        zone = self.expr()
+                    else:
+                        wait = self.expr()
+                pts.append(PathPt(value, speed, zone, wait, (k.line, k.col)))
+            elif k.kind == "ident" and k.text == "repeat":
+                self.next()
+                nt = self.peek()
+                if nt.kind != "num":
+                    self.fail("expected a count after 'repeat', e.g.  repeat 3", nt)
+                self.next()
+                repeat, rep_pos = nt.value, (k.line, k.col)
+            elif k.kind == "ident" and k.text == "forever":
+                self.next()
+                forever, rep_pos = True, (k.line, k.col)
+            else:
+                self.fail("a path contains  at <value> [speed S] [zone Z] [wait T]  lines, then optionally  repeat N  or  forever", k)
+        self.expect_sym("}")
+        node.paths.append(PathDecl(nm.text, ot.text, pts, repeat, forever, pos, (ot.line, ot.col), rep_pos))
+
     def item(self, node: Node):
         t = self.peek()
+        if t.kind == "ident" and t.text == "path" and self.peek(1).kind == "ident":
+            return self.path_decl(node)
+        if (t.kind == "ident" and t.text == "done" and self.peek(1).kind == "ident"
+                and self.peek(2).kind == "sym" and self.peek(2).text == "{"):
+            self.next()
+            nm = self.next()
+            node.events.append(Event("done", None, nm.text, [], self.block(), (t.line, t.col)))
+            return
         if t.kind != "kw":
             self.fail("expected a declaration: const, input, output, var, enum, struct, func, proc, every, when, on, heartbeat, start or serial", t)
         pos = (t.line, t.col)
@@ -805,6 +962,10 @@ class Parser:
         pos = (t.line, t.col)
         if t.kind == "kw" and t.text == "if":
             return self.if_stmt()
+        if t.kind == "ident" and t.text in ("run", "stop") and self.peek(1).kind == "ident":
+            self.next()
+            nm = self.next()
+            return RunPath(nm.text, pos) if t.text == "run" else StopOut(nm.text, pos)
         if t.kind == "kw" and t.text == "goto":
             self.next()
             nm = self.expect_name("a state name")
@@ -1012,5 +1173,9 @@ class Parser:
         self.fail(f"expected a value but found {found}", t)
 
 
-def parse(src: str) -> Node:
-    return Parser(lex(src)).program()
+def parse(src: str, path: str = "<input>", sources=None) -> Node:
+    """`sources` (a dict) is filled with {file number: (path, text)} so errors in imported files can be shown."""
+    ctx = ImportCtx(path, sources) if (sources is not None or "import" in src) else None
+    if ctx is not None:
+        ctx.sources[0] = (path, src)
+    return Parser(lex(src), ctx, path).program()

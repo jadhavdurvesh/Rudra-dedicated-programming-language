@@ -1,14 +1,17 @@
 """PC simulator. Mirrors the generated C++ loop step for step (1 ms ticks)."""
 from __future__ import annotations
 
+import os
 import re
 from typing import List, Tuple
 
 from .check import Checked
 from .link import protocol_hash
+from . import bytecode as B
+from . import genvm
 from . import ir as I
 from .syntax import (IO, Never, Var, fmt_expr)
-from .util import (US_PERIOD, ANIM_MAX_PERIOD, ANIM_MIN_PERIOD, ANIM_MODES, ANIM_STEP_MS, anim_frame,
+from .util import (US_PERIOD, path_interval, ANIM_MAX_PERIOD, ANIM_MIN_PERIOD, ANIM_MODES, ANIM_STEP_MS, anim_frame,
                    i2c_decode, pack_rgb, rt_div, rt_mod, wrap32)
 
 _STRTOL = re.compile(r"^[ \t]*([+-]?\d+)")
@@ -22,6 +25,73 @@ def parse_time(text: str) -> int:
     return int(m.group(1)) * (1000 if m.group(2) == "s" else 1)
 
 
+class _VMHost(B.Host):
+    """Lets the reference VM drive the simulator exactly like the C++ firmware drives the node."""
+
+    def __init__(self, sim, tb):
+        self.sim, self.tb = sim, tb
+
+    def gget(self, slot, idx):
+        v = self.sim.vars[self.tb.slots[slot][0]]
+        v = v if idx is None else v[idx]
+        return int(v)
+
+    def gset(self, slot, idx, v):
+        name, ty, _ = self.tb.slots[slot]
+        v = bool(v) if ty == "bool" else v
+        if idx is None:
+            self.sim.vars[name] = v
+        else:
+            self.sim.vars[name][idx] = v
+
+    def inp(self, i):
+        return int(self.sim._ev(I.In(self.tb.ins[i], "int"), {}))
+
+    def outr(self, i):
+        return int(self.sim._ev(I.Out(self.tb.outs[i], "int"), {}))
+
+    def seto(self, i, v):
+        name = self.tb.outs[i]
+        self.sim._set_out(name, bool(v) if self.sim.ios[name].kind == "digital" else v)
+
+    def goto(self, s):
+        self.sim._goto(self.tb.states[s])
+
+    def runp(self, i):
+        self.sim._path_run(self.tb.paths[i])
+
+    def stopo(self, i):
+        self.sim._path_stop(self.tb.outs[i])
+
+    def cancel(self, i):
+        self.sim._path_cancel(self.tb.outs[i])
+
+    def prun(self, i):
+        return self.sim.pst[self.tb.paths[i]] != 0
+
+    def send(self, m, v):
+        self.sim._tx(self.tb.messages[m] if v is None else f"{self.tb.messages[m]} {v}")
+
+    def fill(self, strip, a):
+        self.sim._fill(self.tb.strips[strip], *a)
+
+    def pixel(self, strip, idx, a):
+        self.sim._pixel(self.tb.strips[strip], idx, *a)
+
+    def anim(self, strip, mode, a):
+        n = self.tb.strips[strip]
+        if mode == 255:
+            self.sim._cancel_anim(n)
+        elif mode == B.ANIM_RAINBOW:
+            self.sim._animate(n, mode, 0, 0, 0, a[0])
+        else:
+            self.sim._animate(n, mode, *a)
+
+    def bad_index(self, i):
+        self.sim.oob += 1
+        self.sim._bb(6, i)
+
+
 class Sim:
     """phys entries mirror what the hardware would see, in this form:
        ("W", t, pin, value)            digitalWrite / analogWrite
@@ -30,7 +100,7 @@ class Sim:
        ("N", t, c0, c1, ...)           neopixel show() with packed 0xRRGGBB pixels
     """
 
-    def __init__(self, ck: Checked):
+    def __init__(self, ck: Checked, engine=None, vm_slack: int = 256):
         self.ck = ck
         self.node = ck.node
         self.syms = ck.syms
@@ -66,12 +136,30 @@ class Sim:
         self.m_last = {n: 0 for n in self.cur}
         self.sp = {n: 0 for n, d in self.ios.items() if d.kind == "stepper"}     # stepper position
         self.t_stp = {n: 0 for n in self.sp}
+        self.iv = {n: self.ios[n].cfg["interval"] for n in self.sp}          # current step interval (paths change it)
+        self.path_list = list(self.node.paths)
+        self.pst = {p.name: 0 for p in self.path_list}                      # 0 idle, 1 moving, 2 waiting
+        self.pidx = {p.name: 0 for p in self.path_list}
+        self.prep = {p.name: 0 for p in self.path_list}
+        self.pt = {p.name: 0 for p in self.path_list}
+        self.path_done = {e.name: e for e in self.node.events if e.kind == "done"}
         self.db = {n: {"v": False, "c": False, "t": 0} for n, d in self.ios.items()
                    if d.direction == "input" and d.kind == "digital" and d.cfg.get("debounce")}
         self.us = {n: {"v": 0, "t": 0} for n, d in self.ios.items() if d.kind == "ultrasonic"}
         self.fn_by_name = {f.name: f for f in ck.fns}
         self.low = I.Lowerer(ck)
         self._lxc = {}
+        self.vm = None
+        if engine == "vm" or (engine is None and os.environ.get("RUDRA_ENGINE") == "vm"):
+            fimg = B.assemble(ck)
+            self.vm_factory = fimg.encode()
+            self.vm_caps = genvm.caps(fimg, vm_slack)
+            self.vm_buf = bytearray(self.vm_caps["cap"])
+            self.vm_buf[:len(self.vm_factory)] = self.vm_factory
+            self.vm_len, self.vm_valid = len(self.vm_factory), True
+            self.image = B.decode(self.vm_factory)              # through the real file format
+            self.vm = B.VM(self.image, B.tables(ck), _VMHost(self, B.tables(ck)))
+            self._hidx = {id(e.body): k for k, e in enumerate(ck.node.events)}
         self.state_names = list(ck.states)
         self.st = 0
         self.bb_on = self.node.blackbox_pos is not None
@@ -97,8 +185,82 @@ class Sim:
         self._setup()
 
     # ---- setup / loop (same order as the generated C++)
+    # ---- paths (mirrors the generated r_paths / path_* functions)
+    def _path_by_name(self, name):
+        return next(p for p in self.path_list if p.name == name)
+
+    def _path_enter(self, p):
+        pt = p.points[self.pidx[p.name]]
+        if p.kind == "stepper":
+            self.iv[p.out] = path_interval(pt.sp, self.ios[p.out].cfg["interval"])
+            self._set_out(p.out, pt.v)
+            self.pst[p.name] = 1
+        else:
+            self._set_out(p.out, pt.v)
+            self.pst[p.name], self.pt[p.name] = 2, self.now
+
+    def _path_next(self, p):
+        n = p.name
+        self.pidx[n] += 1
+        if self.pidx[n] < len(p.points):
+            self._path_enter(p)
+        elif p.forever or self.prep[n] > 1:
+            if not p.forever:
+                self.prep[n] -= 1
+            self.pidx[n] = 0
+            self._path_enter(p)
+        else:
+            self.pst[n] = 0
+            if p.kind == "stepper":
+                self.iv[p.out] = self.ios[p.out].cfg["interval"]
+            if n in self.path_done:
+                self._run(self.path_done[n].body, {})
+
+    def _path_cancel(self, out):
+        for p in self.path_list:
+            if p.out == out:
+                self.pst[p.name] = 0
+        if out in self.iv:
+            self.iv[out] = self.ios[out].cfg["interval"]
+
+    def _path_run(self, name):
+        p = self._path_by_name(name)
+        self._path_cancel(p.out)
+        self.pidx[name], self.prep[name] = 0, p.repeat
+        self._path_enter(p)
+
+    def _path_stop(self, out):
+        self._path_cancel(out)
+        d = self.ios[out]
+        if d.kind == "stepper":
+            if self.out[out] != self.sp[out]:
+                self.log.append((self.now, f"{out} -> position {self.sp[out]}"))
+            self.out[out] = self.sp[out]
+        else:
+            self._set_out(out, d.cfg["safe"])
+
+    def _paths(self, now):
+        for p in self.path_list:
+            n = p.name
+            st = self.pst[n]
+            if st == 0:
+                continue
+            pt = p.points[self.pidx[n]]
+            if st == 1:
+                if abs(self.sp[p.out] - pt.v) <= pt.zn:
+                    if pt.wt > 0:
+                        self.pst[n], self.pt[n] = 2, now
+                    else:
+                        self._path_next(p)
+            elif now - self.pt[n] >= pt.wt:
+                self._path_next(p)
+
     def _apply_safe(self):
         """Store every safe value first, then write the hardware, like the generated r_apply_safe()."""
+        for p in self.path_list:
+            self.pst[p.name] = 0
+        for n in self.iv:
+            self.iv[n] = self.ios[n].cfg["interval"]
         plain = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output" and d.kind != "neopixel"]
         for d in plain:
             sv = d.cfg["safe"]
@@ -223,6 +385,7 @@ class Sim:
                     if c and not self.w_prev[i]:
                         self._run(e.body, {})
                     self.w_prev[i] = c
+        self._paths(now)
         if self.ck.uses_anim:
             el = now - self.t_anim
             if el >= ANIM_STEP_MS:
@@ -265,7 +428,7 @@ class Sim:
         for name, d in self.ios.items():
             if d.kind != "stepper":
                 continue
-            iv = d.cfg["interval"]
+            iv = self.iv[name]
             if now - self.t_stp[name] >= iv:
                 self.t_stp[name] = now if now - self.t_stp[name] >= 2 * iv else self.t_stp[name] + iv
                 if self.sp[name] != self.out[name]:
@@ -341,6 +504,10 @@ class Sim:
         for t in toks:
             m = _STRTOL.match(t)
             args.append(wrap32(int(m.group(1))) if m else 0)
+        if self.vm is not None and name in ("IMG", "IMGEND", "IMGRESET", "IMGINFO"):
+            self._heard()
+            self._vm_cmd(name, line.lstrip(" ")[len(name) + 1:])
+            return
         if name == "PING":
             self._heard()
             self._tx("PONG")
@@ -378,6 +545,59 @@ class Sim:
             self._run(pick.body, dict(zip(pick.params, args)))
             return
         self._tx("ERR")
+
+    def _vm_start(self):
+        for _, e in self.events:
+            if e.kind == "start":
+                self._run(e.body, {})
+
+    def _vm_cmd(self, name, rest):
+        """Image management; mirrors vm_cmd_* in the generated firmware."""
+        cap = self.vm_caps["cap"]
+        if name == "IMGINFO":
+            self._tx(f"IMGINFO {cap} {self.vm_len} {1 if self.vm_valid else 0}")
+        elif name == "IMGRESET":
+            self.vm_buf[:len(self.vm_factory)] = self.vm_factory
+            self.vm_len, self.vm_valid = len(self.vm_factory), True
+            self.image = B.decode(self.vm_factory)
+            self.vm.img = self.image
+            self._tx("IMGOK")
+            self._vm_start()
+        elif name == "IMG":
+            m = re.match(r" *([+-]?\d+)", rest)
+            if not m or int(m.group(1)) < 0:
+                self._tx("ERR")
+                return
+            off = int(m.group(1))
+            run = rest[m.end():].lstrip(" ").split(" ")[0]
+            if len(run) % 2 or len(run) // 2 > 16 or not re.fullmatch(r"[0-9a-fA-F]*", run):
+                self._tx("ERR")
+                return
+            data = bytes.fromhex(run)
+            if not data or off + len(data) > cap:
+                self._tx("ERR")
+                return
+            if self.vm_valid:
+                self.vm_valid, self.vm_len = False, 0
+                self._apply_safe()
+            self.vm_buf[off:off + len(data)] = data
+            self._tx("OK")
+        else:                                                   # IMGEND <length> <checksum>
+            m = re.match(r" *([+-]?\d+) *([+-]?\d+)?", rest)
+            if not m or m.group(2) is None:
+                self._tx("ERR")
+                return
+            n, chk = int(m.group(1)), int(m.group(2))
+            ok = 0 <= n <= cap and B.accept(bytes(self.vm_buf[:n]), B.shape_hash(self.ck),
+                                            len(self.node.events), len(self.ck.fns), self.vm_caps, chk & 0xFFFFFFFF)
+            if not ok:
+                self._tx("ERR")
+                return
+            self.image = B.decode(bytes(self.vm_buf[:n]))
+            self.vm.img = self.image
+            self.vm_len, self.vm_valid = n, True
+            self._tx("IMGOK")
+            self._vm_start()
 
     def _heard(self):
         if self.hb is not None:
@@ -523,6 +743,10 @@ class Sim:
         return self._lxc[k][1]
 
     def _run(self, ast_body, args):
+        if self.vm is not None:
+            if not self.vm_valid:
+                return None
+            return self.vm.run(self._hidx[id(ast_body)], [int(v) for v in args.values()])
         return self._exec(self.low.body(ast_body, tuple(args)), args)
 
     def _ev(self, e, args):
@@ -554,6 +778,8 @@ class Sim:
             return self.out[e.name]
         if isinstance(e, I.CallE):
             return self._call(e, args)
+        if isinstance(e, I.Running):
+            return self.pst[e.name] != 0
         if isinstance(e, I.Neg):
             return wrap32(-self._ev(e.e, args))
         if isinstance(e, I.Not):
@@ -618,6 +844,12 @@ class Sim:
                 args[s.name] = self._ev(s.e, args)
             elif isinstance(s, I.SetO):
                 self._set_out(s.name, self._ev(s.e, args))
+            elif isinstance(s, I.RunS):
+                self._path_run(s.name)
+            elif isinstance(s, I.StopS):
+                self._path_stop(s.out)
+            elif isinstance(s, I.CancelS):
+                self._path_cancel(s.out)
             elif isinstance(s, I.IfS):
                 r = None
                 if self._ev(s.cond, args):

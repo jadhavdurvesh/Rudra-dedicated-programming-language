@@ -1,0 +1,26 @@
+// Scanner head: a stepper pan that sweeps through waypoints, and a drive motor with a timed pattern.
+//   SCAN  run the sweep (forever)    ONCE  one pass, then report    HALT  stop where it is
+node scanner target esp32 {
+  serial 115200
+  output pan:   stepper(step 25, dir 26, rate 200, safe 0)
+  output drive: motor(pwm 18, dir 19, safe 0)
+
+  path sweep for pan {
+    at 100 speed 400 zone 2
+    at 300 speed 100 wait 500
+    at 0
+    forever
+  }
+  path pulse for drive {
+    at 60 wait 300
+    at 0 wait 200
+    repeat 3
+  }
+
+  on SCAN { run sweep }
+  on ONCE { run pulse }
+  on HALT { stop pan  stop drive }
+  on BUSY { send "S", sweep  send "P", pulse }
+  done pulse { send "PULSE" }
+  heartbeat 60s
+}

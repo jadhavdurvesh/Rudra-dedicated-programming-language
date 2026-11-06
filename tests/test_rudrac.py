@@ -381,10 +381,12 @@ class ParityMixin:
         r = subprocess.run(cmd, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    VM = None       # True: build the bytecode-VM firmware and drive the simulator through the VM
+
     def build_src(self, ck, tag, extra=()):
         ino = os.path.join(self.tmp, tag + ".ino")
         with open(ino, "w") as f:
-            f.write(generate(ck, tag))
+            f.write(generate(ck, tag, vm=self.VM))
         exe = os.path.join(self.tmp, tag + ".exe")
         self.gpp([f'-DSKETCH="{ino}"', *extra, os.path.join(HERE, "harness.cpp")], exe)
         return exe
@@ -416,7 +418,7 @@ class ParityMixin:
                     stdin.append(f"{ms} ANALOG {d.pin.key} {b}")
         out = subprocess.run([exe], input="\n".join(stdin) + "\n", capture_output=True, text=True).stdout
         head, _, tx = out.partition("---TX---\n")
-        sim = Sim(ck)
+        sim = Sim(ck, engine="vm" if self.VM else None)
         sim.run(end, events)
         return head.splitlines(), tx.splitlines(), sim
 

@@ -42,6 +42,10 @@ node NAME target nano|uno|esp32|esp32s3 {
 }
 ```
 
+**Imports:** `import "common.rudra"` before `node` · library files hold only const/enum/struct/func/proc/never · `pin FAN_PIN` works with a const.
+
+**VM nodes:** `rudrac build --vm` · `rudrac image n.rudra` -> `.rimg` · `rudrac push n.rimg PORT` · lines `IMG off hex` / `IMGEND len sum` / `IMGRESET` / `IMGINFO` (reserved command names).
+
 **Data:** `enum Mode { idle, scan }` (`Mode.scan`; `==`/`!=` only) · `struct P { x: int, hot: bool }` · `var a: int[8]` · `var p: P` · `var ps: P[3]` · `a[i]` · `p.x` · `ps[i].x`. Bad index: read = 0, write refused + counted in STATUS + black box code 6. Constant index out of range = compile error.
 
 **Statements:** `let x = e` · `for i in 0..8 { ... break ... }` (constant bounds) · `return e` · `f(x)` · `x = e` · `if c { } else { }` · `send "NAME", e` · `goto state` · `fill s, r, g, b` · `pixel s, i, r, g, b` · `animate s, blink|pulse|chase, r, g, b, 500ms` · `animate s, rainbow, 3s` · `animate s, off`
@@ -54,3 +58,13 @@ node NAME target nano|uno|esp32|esp32s3 {
 
 **Rules of thumb:** keep writing a motor in an `every` if it has a `timeout` · a stepper needs a position, not a speed · `send` on a bus only inside `on` ·
 never rely on software alone for anything dangerous: add a hardware cut-off.
+
+## Motion (v0.11)
+```
+path NAME for OUT { at POS [speed 1..1000] [zone 0..10000] [wait ms]  ...  repeat N | forever }
+run NAME     stop OUT     done NAME { ... }     NAME  (bool: running)
+```
+Stepper: POS in steps. Motor: POS is a speed -100..100, only `wait` applies. A safe state or a direct write ends paths.
+
+## Tools (v0.12)
+`rudrac fmt F` tidy layout   `rudrac lsp` editor server   `rudrac conform` run the conformance suite   spec: SPEC.md

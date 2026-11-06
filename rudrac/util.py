@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-VERSION = "0.8.0"
+VERSION = "0.12.0"
 US_PERIOD = 60   # ms between ultrasonic measurements
 
 
@@ -25,11 +25,17 @@ class RudraError(Exception):
         self.diags = list(diags)
 
 
-def format_diag(d: Diag, src: str, filename: str) -> str:
-    out = f"{filename}:{d.line}:{d.col}: {d.level}: {d.msg}"
+LINE_STRIDE = 100000     # a position in an imported file is  file_number * LINE_STRIDE + line
+
+
+def format_diag(d: Diag, src: str, filename: str, sources=None) -> str:
+    fid, line = divmod(d.line, LINE_STRIDE)
+    if fid and sources and fid in sources:
+        filename, src = sources[fid]
+    out = f"{filename}:{line}:{d.col}: {d.level}: {d.msg}"
     lines = src.splitlines()
-    if 1 <= d.line <= len(lines):
-        out += f"\n    {lines[d.line - 1]}\n    {' ' * max(d.col - 1, 0)}^"
+    if 1 <= line <= len(lines):
+        out += f"\n    {lines[line - 1]}\n    {' ' * max(d.col - 1, 0)}^"
     if d.hint:
         out += f"\n    hint: {d.hint}"
     return out
@@ -229,9 +235,14 @@ def anim_frame(mode: int, n: int, elapsed: int, per: int, c) -> list:
 # --------------------------------------------------------------------------
 # Protocol hash: lets the master check it is talking to the firmware it was generated for
 # --------------------------------------------------------------------------
-def fnv31(text: str) -> int:
+def path_interval(speed, declared):
+    """Milliseconds between steps for a waypoint's `speed` (steps/s); None keeps the stepper's declared rate."""
+    return declared if speed is None else max(1, 1000 // speed)
+
+
+def fnv31(text) -> int:
     h = 0x811C9DC5
-    for b in text.encode("utf-8"):
+    for b in (text if isinstance(text, (bytes, bytearray)) else text.encode("utf-8")):
         h ^= b
         h = (h * 0x01000193) & 0xFFFFFFFF
     return h & 0x7FFFFFFF

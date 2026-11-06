@@ -1,0 +1,10 @@
+import "common.rudra"
+node zone_a target nano {
+  output fan: digital(pin FAN_PIN, safe true)
+  output heater: digital(pin HEATER_PIN, safe false)
+  on SETPOINT(t) { send "SP", clamp(t, 0, TEMP_LIMIT) }
+  on HEAT(v) { heater = v > 0 }
+  on FAN(v) { fan = v > 0 }
+  address 3
+  heartbeat 3s
+}

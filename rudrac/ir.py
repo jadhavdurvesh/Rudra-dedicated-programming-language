@@ -86,7 +86,28 @@ class Elem:                 # array element (also a field of an array of structs
     ty: str
 
 
+@dataclass
+class Running:              # a path name used as a value: true while the path is active
+    name: str
+    ty: str = "bool"
+
+
 # ---------------------------------------------------------------- statements
+@dataclass
+class RunS:                 # run PATH
+    name: str
+
+
+@dataclass
+class StopS:                # stop OUTPUT: end every path on it and hold (stepper stays where it is, motor to its safe speed)
+    out: str
+
+
+@dataclass
+class CancelS:              # inserted before a direct write to an output that has paths: the write wins, paths on it end
+    out: str
+
+
 @dataclass
 class LetS:
     name: str
@@ -185,7 +206,7 @@ class SendS:
     is_bool: bool = False
 
 
-EXPR = (K, Loc, Glob, In, Out, Neg, Not, Op, CallE, Elem)
+EXPR = (K, Loc, Glob, In, Out, Neg, Not, Op, CallE, Elem, Running)
 CMP = ("<", "<=", ">", ">=", "==", "!=", "&&", "||")
 
 
@@ -199,6 +220,7 @@ class Lowerer:
         self.ck = ck
         self.syms = ck.syms
         self.fns = {f.name: f for f in ck.fns}
+        self.path_outs = {p.out for p in ck.node.paths}
         self._bodies: Dict[tuple, list] = {}
         self._fnir: Dict[str, list] = {}
 
@@ -234,6 +256,8 @@ class Lowerer:
                 return K(s.value, ty)
             if s.kind == "var":
                 return Glob(e.name, ty)
+            if s.kind == "path":
+                return Running(e.name)
             if s.kind == "input":
                 return In(e.name, ty)
             return Out(e.name, ty)
@@ -265,6 +289,8 @@ class Lowerer:
                 elif self.syms[s.name].kind == "var":
                     out.append(SetG(s.name, v))
                 else:
+                    if s.name in self.path_outs:
+                        out.append(CancelS(s.name))
                     out.append(SetO(s.name, v))
             elif isinstance(s, S.AssignTo):
                 t = s.target
@@ -273,6 +299,10 @@ class Lowerer:
                     out.append(SetG(t.slot, v))
                 else:
                     out.append(SetE(t.slot, self.e(t.idx, sc), t.size, bool(t.proven), v, ty_of(t.ty)))
+            elif isinstance(s, S.RunPath):
+                out.append(RunS(s.name))
+            elif isinstance(s, S.StopOut):
+                out.append(StopS(s.out))
             elif isinstance(s, S.Let):
                 ty = ty_of(s.type)
                 out.append(LetS(s.name, self.e(s.expr, sc), ty))
@@ -425,6 +455,8 @@ def fmt(x) -> str:
         return f"{x.fn}({', '.join(fmt(a) for a in x.args)})"
     if isinstance(x, Elem):
         return f"@{x.slot}[{fmt(x.idx)}]{'' if x.proven else '?'}"
+    if isinstance(x, Running):
+        return f"running:{x.name}"
     return repr(x)
 
 
@@ -459,6 +491,12 @@ def dump_body(body, ind=1) -> List[str]:
                 out += dump_body(s.els, ind + 1)
         elif isinstance(s, GotoS):
             out.append(f"{pad}goto {s.state} (#{s.index})")
+        elif isinstance(s, RunS):
+            out.append(f"{pad}run {s.name}")
+        elif isinstance(s, StopS):
+            out.append(f"{pad}stop {s.out}")
+        elif isinstance(s, CancelS):
+            out.append(f"{pad}cancel paths on {s.out}")
         elif isinstance(s, SendS):
             out.append(f"{pad}send {s.msg!r}" + ("" if s.e is None else f" {fmt(s.e)}{' (bool)' if s.is_bool else ''}"))
         else:

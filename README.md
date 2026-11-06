@@ -319,12 +319,109 @@ program means. `python3 -m rudrac ir file.rudra` prints it, and `ir.validate()` 
 One consequence worth knowing: because sim and C++ now share the lowering, comparing them can no longer catch a mistake *in* the lowering. That is why
 `tests/test_b1.py` also pins golden values (`K + 1`, wraparound, division by zero, `-7 % 3`, out-of-range reads) that were worked out independently.
 
+## Imports: one definition, many nodes (v0.10)
+
+```
+// common.rudra  (a library: no `node`, no hardware, no handlers)
+const FAN_PIN = 6
+const TEMP_LIMIT = 80
+func clamp(x: int, lo: int, hi: int) -> int { ... }
+never heater and not fan            // the shared interlock set
+
+// zone_a.rudra
+import "common.rudra"
+node zone_a target nano {
+  output fan: digital(pin FAN_PIN, safe true)      // a const can name a pin
+  ...
+}
+```
+A library may contain only `const`, `enum`, `struct`, `func`, `proc` and `never` rules (and further imports). Paths are relative to the importing file; a file
+imported twice (diamond) is loaded once; cycles and missing files are errors. Library items are checked in the context of each importing node: a shared
+`never heater and not fan` is an error in a node that has no `heater`, and the message points into the library file. Unused library functions do not warn.
+See `examples/shared/`. Not done: namespaces/qualified names (all imported names share the node's namespace, so a clash is a compile error).
+
+## Changing a node's program without reflashing (v0.9)
+
+```
+python3 -m rudrac build node.rudra --vm      # firmware whose handler/function bodies run as bytecode
+python3 -m rudrac image node.rudra --disasm  # node.rimg: the bodies compiled to bytecode
+python3 -m rudrac push node.rimg /dev/ttyUSB0   # needs pyserial; or use rudrac.push from your own master
+python3 -m rudrac cost node.rudra --vm       # time/RAM estimate including interpreter overhead
+```
+In a VM node **everything that touches hardware or the protocol stays in firmware**: pins, safe states, `never` rules, timers, `when` conditions,
+the command set, message names, variables. Only the bodies of handlers and functions are in the image, so an image cannot unlock an output the
+firmware does not have, bypass an interlock, or send a message the master does not know. The image carries a *shape hash* of what stayed in
+firmware; an image built from a program with a different shape is refused, and so is any image with a bad checksum, wrong length, or more
+stack than the firmware was built for (build-time slack: 256 bytes of image, +16 stack/frame slots).
+
+Wire format (ASCII lines): `IMG <offset> <hex>` (<= 8 bytes), `IMGEND <length> <checksum>` -> `IMGOK` or `ERR`, `IMGRESET` -> `IMGOK`
+(back to the built-in program), `IMGINFO` -> `IMGINFO <capacity> <length> <valid>`.
+**While an update is in progress the node is in its safe state and ignores commands** (the first `IMG` line forces the safe states). After a
+successful `IMGEND` the new `start` handlers run; variables keep their values. A refused or interrupted update leaves the node safe and quiet until
+`IMGRESET` or a good image. Images live in RAM: a reset returns the node to its built-in program.
+Not done yet: `when` conditions that call functions are refused with `--vm`; images are not persisted to EEPROM/flash; none of it has run on a real board.
+The simulator can run on bytecode too (`RUDRA_ENGINE=vm`), and the whole test suite passes in both modes.
+
+## Motion words: `path`, `run`, `stop`, `done` (v0.11, stage A6)
+
+A path is a bounded table of waypoints for a stepper or a motor, in the KRL/RAPID spirit. The node runs it from the
+main loop, so no handler ever blocks.
+
+```
+path sweep for pan {          // pan is a stepper
+  at 100 speed 400 zone 2     // go to step 100 at 400 steps/s; count as arrived within 2 steps
+  at 300 speed 100 wait 500   // then hold 500 ms
+  at 0
+  forever                     // or  repeat N  (1..1000);  default is once
+}
+path pulse for drive {        // drive is a motor: the value is a speed -100..100, only `wait` applies
+  at 60 wait 300
+  at 0 wait 200
+  repeat 3
+}
+on SCAN { run sweep }         // starts at waypoint 0 and replaces any path running on the same output
+on HALT { stop pan  stop drive }
+done pulse { send "PULSE" }   // runs when a finite path completes
+on BUSY { send "S", sweep }   // a path's name is a bool: is it running?
+```
+
+- Limits are checked at compile time: 1..64 `at` lines, `speed` 1..1000 steps/s, `zone` 0..10000, `wait` 0..3600000 ms, `repeat` 1..1000.
+- `speed`, `zone` and `wait` are ordinary names elsewhere; they are only keywords inside a `path`.
+- `stop` on a stepper holds where it is; on a motor it goes to the declared safe value. A direct write (`pan = 5`) also ends the paths on that output.
+- A safe state (heartbeat lost) ends every path and restores the declared step rate.
+- Motion still goes through the checked setters: a move that a `never` rule refuses is not made and is counted in STATUS. A motor path keeps its timing even then; a stepper path waits for a position it never reaches until you `stop` or `run` another path.
+- Stepper arrival is measured against the waypoint, not the target; speed changes the step interval for that leg only.
+- Works with `--vm`: paths stay in firmware, `run`/`stop` are bytecode ops, a program update may change which paths are run and what `done` does, but not the waypoint tables themselves.
+- Cost: each path adds a small fixed per-pass cost and 9 bytes; `done` bodies count like timer bodies. Estimates, not measurements.
+- Example: `examples/scanner_esp32.rudra`.
+
+## Formatter, editor support, spec and conformance suite (v0.12, stages B3/B4)
+
+```
+python3 -m rudrac fmt file.rudra          # tidy layout in place  (--check: exit 1 if it would change; --stdout)
+python3 -m rudrac lsp                     # language server on stdin/stdout (diagnostics, outline, hover, format)
+python3 -m rudrac conform                 # run conformance/ against the reference implementation
+```
+* `fmt` only changes layout: indentation (two spaces per `{`, one more inside open parentheses), missing or stray spaces, trailing blanks,
+  runs of blank lines. It keeps your line breaks, comments and any extra spaces you typed (so aligned columns stay aligned).
+  It refuses to write anything unless the compiler's token stream is identical before and after, and every example file is already in its output form.
+* `lsp` speaks the Language Server Protocol over stdio with the standard library only: error and warning squiggles from the same parser and checker the compiler uses
+  (problems in imported files are shown on line 1), document outline, hover on declared names, format document. Point any editor's generic LSP client at
+  `python3 -m rudrac lsp` for `*.rudra`. Tested here over a real pipe, not in a real editor.
+* `SPEC.md` is the language specification. `conformance/` holds 34 cases (program, scenario, exact expected hardware writes and transmitted lines, or the exact diagnostics
+  for a program that must be rejected). The reference passes them four ways: simulator, simulator through the bytecode VM, generated C++, generated `--vm` C++.
+  The expected outputs came from the reference simulator; I checked the arithmetic and interlock ones by hand. A second implementation passing all 34 would agree with this one on those programs, not on every program.
+
+## First run on a real board
+
+See [BRINGUP.md](BRINGUP.md): a step-by-step checklist (loads disconnected first), what to measure, and how to record differences from the simulator.
+
 ## Tests
 
 ```
 python3 -m unittest discover -s tests -v
 ```
-164 tests. The heavy ones compile the **generated C++** with `g++ -Wall -Wextra -Werror` against a fake Arduino core (digital/PWM, servo, I2C, NeoPixel, serial),
+253 tests. The heavy ones compile the **generated C++** with `g++ -Wall -Wextra -Werror` against a fake Arduino core (digital/PWM, servo, I2C, NeoPixel, serial),
 replay seconds of inputs and commands, and compare every hardware effect and serial line **with its timestamp** against the simulator,
 for all examples, all four animation modes on Nano and ESP32 targets, the interlock examples, and every v0.4 feature (debounce, `when..for`, scoped states, motor ramp/limit/timeout, stepper, bus addressing and RS485 pin, black box).
 To check the tests are not vacuous, deliberate breakages were injected (animation maths, the interlock check, and eight v0.4 ones such as an off-by-one in debounce, ramp not passing through zero, broadcast answering, `goto` same state re-entering): all are caught.

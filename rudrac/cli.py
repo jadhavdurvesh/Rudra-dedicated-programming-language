@@ -25,14 +25,15 @@ def load(path):
     except OSError as e:
         print(f"rudrac: cannot read {path}: {e}", file=sys.stderr)
         return None
+    sources = {}
     try:
-        ck = check(parse(src))
+        ck = check(parse(src, path, sources))
     except RudraError as e:
         for d in e.diags:
-            print(format_diag(d, src, path), file=sys.stderr)
+            print(format_diag(d, src, path, sources), file=sys.stderr)
         return None
     for d in ck.diags:
-        print(format_diag(d, src, path), file=sys.stderr)
+        print(format_diag(d, src, path, sources), file=sys.stderr)
     if not ck.ok:
         n = len(ck.errors)
         print(f"\n{path}: {n} error{'s' if n != 1 else ''}", file=sys.stderr)
@@ -57,10 +58,54 @@ def cmd_check(a):
     return 0
 
 
+def cmd_image(a):
+    from . import bytecode as B
+    ck = load(a.file)
+    if ck is None:
+        return 1
+    img = B.assemble(ck)
+    data = img.encode()
+    if a.disasm:
+        print(B.disassemble(img))
+    out = a.out or os.path.splitext(a.file)[0] + ".rimg"
+    with open(out, "wb") as f:
+        f.write(data)
+    print(f"wrote {out}: {len(data)} bytes, shape {img.shape}, needs stack {img.stack}, frame {img.frame}, call depth {img.calls}")
+    return 0
+
+
+def cmd_push(a):
+    from . import push as P
+    try:
+        import serial
+    except ImportError:
+        print("push needs pyserial:  pip install pyserial", file=sys.stderr)
+        return 1
+    with open(a.image, "rb") as f:
+        data = f.read()
+    with serial.Serial(a.port, a.baud, timeout=2) as port:
+        import time
+        time.sleep(2)                      # boards reset when the port opens
+
+        def ask(line):
+            port.write((line + "\n").encode())
+            return port.readline().decode().strip()
+        try:
+            print("node:", P.info(ask))
+            P.push(ask, data, progress=lambda k, n: print(f"\r{k}/{n}", end="", flush=True))
+            print("\nloaded:", P.info(ask))
+        except P.PushError as e:
+            print(f"\nfailed: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def cmd_build(a):
     ck = load(a.file)
     if ck is None:
         return 1
+    if getattr(a, "vm", False):
+        os.environ["RUDRA_ENGINE"] = "vm"
     if a.stdout:
         print(generate(ck, os.path.basename(a.file)))
         return 0
@@ -121,7 +166,7 @@ def cmd_cost(a):
     ck = load(a.file)
     if ck is None:
         return 1
-    rep = analyze(ck, a.model)
+    rep = analyze(ck, a.model, vm=a.vm)
     print(fmt_cost(rep, a.file, ck.node.budget_ms), end="")
     if ck.node.budget_ms is not None and rep.pass_worst > ck.node.budget_ms * 1000:
         return 1
@@ -201,6 +246,44 @@ def cmd_targets(_a):
     return 0
 
 
+def cmd_fmt(a):
+    from .fmt import format_checked
+    rc = 0
+    for path in a.files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            new = format_checked(src)
+        except RudraError as e:
+            for d in e.diags:
+                print(format_diag(d, src, path), file=sys.stderr)
+            print(f"{path}: not formatted (it does not parse)", file=sys.stderr)
+            rc = 1
+            continue
+        if a.check:
+            if new != src:
+                print(f"{path}: would change")
+                rc = 1
+        elif a.stdout:
+            sys.stdout.write(new)
+        elif new != src:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new)
+            print(f"{path}: formatted")
+    return rc
+
+
+def cmd_conform(a):
+    from . import conform
+    root = a.dir or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conformance")
+    return conform.main(root, a.regen)
+
+
+def cmd_lsp(a):
+    from .lsp import serve
+    return serve()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="rudrac", description=f"Rudra compiler {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -213,6 +296,7 @@ def main(argv=None):
     s.add_argument("file")
     s.add_argument("-o", "--out", default="build")
     s.add_argument("--stdout", action="store_true", help="print the C++ instead of writing a file")
+    s.add_argument("--vm", action="store_true", help="firmware that runs the program bodies as bytecode, so they can be replaced over serial")
     s.set_defaults(fn=cmd_build)
 
     s = sub.add_parser("link", help="generate master-side C++ header, Python client and protocol doc")
@@ -225,6 +309,18 @@ def main(argv=None):
     s.add_argument("-o", "--out", default="build")
     s.set_defaults(fn=cmd_bus)
 
+    s = sub.add_parser("image", help="compile the program bodies to a bytecode image (.rimg) a VM firmware can load")
+    s.add_argument("file")
+    s.add_argument("-o", "--out")
+    s.add_argument("--disasm", action="store_true", help="also print the bytecode")
+    s.set_defaults(fn=cmd_image)
+
+    s = sub.add_parser("push", help="send a .rimg to a node running VM firmware over a serial port (needs pyserial)")
+    s.add_argument("image")
+    s.add_argument("port")
+    s.add_argument("--baud", type=int, default=9600)
+    s.set_defaults(fn=cmd_push)
+
     s = sub.add_parser("ir", help="print the typed intermediate representation that sim, C++ and cost all share")
     s.add_argument("file")
     s.set_defaults(fn=cmd_ir)
@@ -232,6 +328,7 @@ def main(argv=None):
     s = sub.add_parser("cost", help="worst-case time per handler, main-loop pass, stack and RAM (model based)")
     s.add_argument("file")
     s.add_argument("--model", help="JSON file that overrides the cost model, e.g. {\"dwrite\": 4}")
+    s.add_argument("--vm", action="store_true", help="estimate for VM firmware (bytecode dispatch overhead, image RAM)")
     s.set_defaults(fn=cmd_cost)
 
     s = sub.add_parser("verify", help="random-test the script against its 'never' rules")
@@ -260,6 +357,20 @@ def main(argv=None):
     s.add_argument("--fail", action="append", metavar="TIME:INPUT", help="i2c input stops answering, e.g. 2s:temp")
     s.add_argument("--heal", action="append", metavar="TIME:INPUT", help="i2c input answers again")
     s.set_defaults(fn=cmd_sim)
+
+    s = sub.add_parser("fmt", help="tidy layout (indentation, spacing, blank lines); never changes the program")
+    s.add_argument("files", nargs="+")
+    s.add_argument("--check", action="store_true", help="change nothing, exit 1 if a file would change")
+    s.add_argument("--stdout", action="store_true", help="print instead of rewriting the file")
+    s.set_defaults(fn=cmd_fmt)
+
+    s = sub.add_parser("conform", help="run the conformance suite (conformance/) against the reference implementation")
+    s.add_argument("dir", nargs="?")
+    s.add_argument("--regen", action="store_true", help="rewrite every expect.json from the simulator (review by hand!)")
+    s.set_defaults(fn=cmd_conform)
+
+    s = sub.add_parser("lsp", help="language server on stdin/stdout, for editor diagnostics")
+    s.set_defaults(fn=cmd_lsp)
 
     s = sub.add_parser("targets", help="list supported boards")
     s.set_defaults(fn=cmd_targets)

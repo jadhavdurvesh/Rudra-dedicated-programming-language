@@ -1,11 +1,13 @@
 """C++ (Arduino framework) code generator. Works for AVR and ESP boards."""
 from __future__ import annotations
 
+import os
+
 from .check import Checked
 from . import ir as I
 from .link import protocol_hash
 from .syntax import (IO, Var, fmt_expr)
-from .util import ANIM_MODES, ANIM_STEP_MS, US_PERIOD, VERSION
+from .util import ANIM_MODES, ANIM_STEP_MS, US_PERIOD, VERSION, path_interval
 
 
 def _cn(slot: str) -> str:
@@ -18,7 +20,9 @@ def _lit(v) -> str:
     return f"{v}L" if v >= 0 else f"({v}L)"
 
 
-def generate(ck: Checked, source_name: str = "<input>") -> str:
+def generate(ck: Checked, source_name: str = "<input>", vm=None, vm_slack: int = 256) -> str:
+    if vm is None:
+        vm = os.environ.get("RUDRA_ENGINE") == "vm"
     node, syms = ck.node, ck.syms
     ios = [d for d in node.decls if isinstance(d, IO)]
     vars_ = [d for d in node.decls if isinstance(d, Var)]
@@ -27,6 +31,7 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
     strips = [d for d in outs if d.kind == "neopixel"]
     motors = [d for d in outs if d.kind == "motor"]
     steppers = [d for d in outs if d.kind == "stepper"]
+    ios_by = {d.name: d for d in node.decls if isinstance(d, IO)}
     sonars = [d for d in ios if d.kind == "ultrasonic"]
     debounced = [d for d in ios if d.direction == "input" and d.kind == "digital" and d.cfg.get("debounce")]
     need_mstep = any(d.cfg.get("ramp") or d.cfg.get("timeout") for d in motors)
@@ -57,6 +62,8 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
             return f"i_{e.name}()"
         if isinstance(e, I.Out):
             return f"o_{e.name}"
+        if isinstance(e, I.Running):
+            return f"(pst_{e.name} != 0)"
         if isinstance(e, I.Elem):
             cn, ix = _cn(e.slot), ge(e.idx)
             if e.proven:
@@ -86,6 +93,12 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
                 out.append(f"{pad}{_cn(s.slot)} = {ge(s.e)};")
             elif isinstance(s, I.SetO):
                 out.append(f"{pad}r_set_{s.name}({ge(s.e)});")
+            elif isinstance(s, I.RunS):
+                out.append(f"{pad}path_run_{s.name}();")
+            elif isinstance(s, I.StopS):
+                out.append(f"{pad}path_stop_{s.out}();")
+            elif isinstance(s, I.CancelS):
+                out.append(f"{pad}path_cancel_{s.out}();")
             elif isinstance(s, I.SetE):
                 cn, v = _cn(s.slot), ge(s.e)
                 if s.proven:
@@ -253,6 +266,12 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
     for d in steppers:
         w(f"static rt_int sp_{d.name} = 0;           /* current position in steps (boot = 0) */")
         w(f"static uint32_t t_stp_{d.name} = 0;")
+        w(f"static uint32_t st_iv_{d.name} = {d.cfg['interval']}UL;   /* step interval now: paths can change it */")
+    for p in node.paths:
+        n = p.name
+        w(f"static uint8_t pst_{n} = 0;   /* path {n}: 0 idle, 1 moving, 2 waiting */")
+        w(f"static uint16_t pidx_{n} = 0, prep_{n} = 0;")
+        w(f"static uint32_t pt_{n} = 0;")
     for d in sonars:
         w(f"static rt_int us_v_{d.name} = 0;   /* last distance in cm; 0 = no echo */")
         w(f"static uint32_t us_t_{d.name} = 0;")
@@ -517,6 +536,10 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
     w("   Stored first, written second, so the result never depends on the order of the outputs.")
     w("   The compiler has already proved that this state satisfies every 'never' rule. */")
     w("static void r_apply_safe(void) {")
+    for p in node.paths:
+        w(f"  pst_{p.name} = 0;   /* a safe state ends every path */")
+    for d in steppers:
+        w(f"  st_iv_{d.name} = {d.cfg['interval']}UL;")
     for d in plain_outs:
         w(f"  o_{d.name} = {_lit(d.cfg['safe'])};")
     for d in motors:
@@ -583,15 +606,91 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
             w("  }")
         w("}")
         w("")
+    if node.paths:
+        w("// ---- paths: waypoint tables run by the main loop (a safe state ends them) ----")
+        by_out = {}
+        for p in node.paths:
+            by_out.setdefault(p.out, []).append(p)
+            n = p.name
+            w(f"static const long pv_{n}[{len(p.points)}] = {{{', '.join(str(pt.v) for pt in p.points)}}};")
+            if p.kind == "stepper":
+                ivs = [path_interval(pt.sp, ios_by[p.out].cfg['interval']) if pt.sp is not None else 0 for pt in p.points]
+                w(f"static const uint16_t piv_{n}[{len(p.points)}] = {{{', '.join(str(v) for v in ivs)}}};   /* ms per step; 0 = the declared rate */")
+                w(f"static const uint16_t pz_{n}[{len(p.points)}] = {{{', '.join(str(pt.zn) for pt in p.points)}}};")
+            w(f"static const uint32_t pw_{n}[{len(p.points)}] = {{{', '.join(str(pt.wt) + 'UL' for pt in p.points)}}};")
+        for out, ps in by_out.items():
+            w(f"static __attribute__((unused)) void path_cancel_{out}(void) {{")
+            for q in ps:
+                w(f"  pst_{q.name} = 0;")
+            if ios_by[out].kind == "stepper":
+                w(f"  st_iv_{out} = {ios_by[out].cfg['interval']}UL;")
+            w("}")
+        done_idx = {e.name: i for i, e in events if e.kind == "done"}
+        for i in done_idx.values():
+            w(f"static void h_{i}(void);")
+        for p in node.paths:
+            n, o = p.name, p.out
+            w(f"static void path_enter_{n}(void) {{")
+            if p.kind == "stepper":
+                w(f"  st_iv_{o} = piv_{n}[pidx_{n}] ? piv_{n}[pidx_{n}] : {ios_by[o].cfg['interval']}UL;")
+                w(f"  r_set_{o}((rt_int)pv_{n}[pidx_{n}]);")
+                w(f"  pst_{n} = 1;")
+            else:
+                w(f"  r_set_{o}((rt_int)pv_{n}[pidx_{n}]);")
+                w(f"  pst_{n} = 2; pt_{n} = rt_now;")
+            w("}")
+            w(f"static void path_next_{n}(void) {{")
+            w(f"  pidx_{n}++;")
+            w(f"  if (pidx_{n} < {len(p.points)}) {{ path_enter_{n}(); }}")
+            if p.forever:
+                w(f"  else {{ pidx_{n} = 0; path_enter_{n}(); }}")
+            else:
+                w(f"  else if (prep_{n} > 1) {{ prep_{n}--; pidx_{n} = 0; path_enter_{n}(); }}")
+                w("  else {")
+                w(f"    pst_{n} = 0;")
+                if p.kind == "stepper":
+                    w(f"    st_iv_{o} = {ios_by[o].cfg['interval']}UL;")
+                if n in done_idx:
+                    w(f"    h_{done_idx[n]}();")
+                w("  }")
+            w("}")
+            w(f"static void path_run_{n}(void) {{")
+            w(f"  path_cancel_{o}();")
+            w(f"  pidx_{n} = 0; prep_{n} = {p.repeat};")
+            w(f"  path_enter_{n}();")
+            w("}")
+        for out in by_out:
+            w(f"static __attribute__((unused)) void path_stop_{out}(void) {{")
+            w(f"  path_cancel_{out}();")
+            if ios_by[out].kind == "stepper":
+                w(f"  o_{out} = sp_{out};   /* hold: the target becomes where it is */")
+            else:
+                w(f"  r_set_{out}({_lit(ios_by[out].cfg['safe'])});")
+            w("}")
+        w("static void r_paths(uint32_t now) {")
+        for p in node.paths:
+            n, o = p.name, p.out
+            w(f"  if (pst_{n}) {{")
+            if p.kind == "stepper":
+                w(f"    if (pst_{n} == 1) {{")
+                w(f"      if (labs((long)sp_{o} - pv_{n}[pidx_{n}]) <= (long)pz_{n}[pidx_{n}]) {{")
+                w(f"        if (pw_{n}[pidx_{n}] > 0) {{ pst_{n} = 2; pt_{n} = now; }} else {{ path_next_{n}(); }}")
+                w("      }")
+                w(f"    }} else if ((uint32_t)(now - pt_{n}) >= pw_{n}[pidx_{n}]) {{ path_next_{n}(); }}")
+            else:
+                w(f"    if ((uint32_t)(now - pt_{n}) >= pw_{n}[pidx_{n}]) {{ path_next_{n}(); }}")
+            w("  }")
+        w("}")
+        w("")
     if steppers:
         w("/* Steppers: one step pulse per interval towards the target position (runs even after the link is lost,")
         w("   so a stepper can reach its safe position at a bounded rate). */")
         w("static void r_stepper_step(uint32_t now) {")
         for d in steppers:
-            n, iv = d.name, d.cfg["interval"]
+            n = d.name
             w("  {")
-            w(f"    if ((uint32_t)(now - t_stp_{n}) >= {iv}UL) {{")
-            w(f"      t_stp_{n} = ((uint32_t)(now - t_stp_{n}) >= {2 * iv}UL) ? now : t_stp_{n} + {iv}UL;")
+            w(f"    if ((uint32_t)(now - t_stp_{n}) >= st_iv_{n}) {{")
+            w(f"      t_stp_{n} = ((uint32_t)(now - t_stp_{n}) >= 2UL * st_iv_{n}) ? now : t_stp_{n} + st_iv_{n};")
             w(f"      if (sp_{n} != o_{n}) {{")
             w(f"        bool fw = o_{n} > sp_{n};")
             w(f"        digitalWrite(P_{n}_dir, fw ? HIGH : LOW);")
@@ -616,7 +715,7 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
         w("}")
         w("")
 
-    if node.fns:
+    if node.fns and not vm:
         def sig(f):
             ps = ", ".join(f"{'bool' if t == 'bool' else 'rt_int'} a_{p[0]}" for p, t in zip(f.params, f.ptypes)) or "void"
             rt = "void" if f.kind == "proc" else ("bool" if f.ret == "bool" else "rt_int")
@@ -663,6 +762,14 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
         w("}")
         w("")
 
+    if vm:
+        from . import bytecode as B, genvm
+        for e in node.events:
+            if e.kind == "when" and any(isinstance(x, I.CallE) for x in I.walk_expr(low.expr(e.arg))):
+                raise ValueError("a 'when' condition that calls a function cannot be used with --vm yet "
+                                 "(conditions stay in firmware, and functions live in the image)")
+        vm_img = B.assemble(ck)
+        genvm.emit(ck, w, vm_img, vm_slack, bb, has_states, [])
     w("// ---- handlers ----")
     for i, e in events:
         if e.kind == "heartbeat" and e.off:
@@ -670,14 +777,29 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
         sig = ", ".join(f"rt_int a_{p}" for p in e.params) or "void"
         label = {"every": f"every {e.ms}ms", "when": "when", "on": f"on {e.name}",
                  "heartbeat": f"heartbeat {e.ms}ms (runs after the safe states are applied)",
-                 "start": "start", "enter": f"enter {e.state}", "exit": f"exit {e.state}"}[e.kind]
+                 "start": "start", "enter": f"enter {e.state}", "exit": f"exit {e.state}",
+                 "done": f"done {e.name}"}[e.kind]
         if e.state and e.kind not in ("enter", "exit"):
             label += f"   [state {e.state}]"
         w(f"// {label}")
         w(f"static void h_{i}({sig}) {{")
         for p in e.params:
             w(f"  (void)a_{p};")
-        L.extend(gs(low.body(e.body, e.params), 1))
+        if vm:
+            if e.params:
+                w(f"  rt_int vm_a[{len(e.params)}] = {{{', '.join('a_' + p for p in e.params)}}};")
+                w(f"  vm_run({i}, vm_a, {len(e.params)});")
+            else:
+                w(f"  vm_run({i}, NULL, 0);")
+        else:
+            L.extend(gs(low.body(e.body, e.params), 1))
+        w("}")
+        w("")
+    if vm:
+        w("static void vm_start(void) {   /* runs the image's 'start' handlers: after boot, after an update, after a reset */")
+        for i, e in events:
+            if e.kind == "start":
+                w(f"  h_{i}();")
         w("}")
         w("")
 
@@ -694,6 +816,11 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
     w("  while (*p && *p != ' ') p++;")
     w("  if (*p) *p++ = 0;")
     w("  if (!*name) return;")
+    if vm:
+        w('  if (!strcmp(name, "IMG")) { RT_HEARD(); vm_cmd_img(p); return; }')
+        w('  if (!strcmp(name, "IMGEND")) { RT_HEARD(); vm_cmd_end(p); return; }')
+        w('  if (!strcmp(name, "IMGRESET")) { RT_HEARD(); vm_cmd_reset(); return; }')
+        w('  if (!strcmp(name, "IMGINFO")) { RT_HEARD(); vm_cmd_info(); return; }')
     if maxp:
         w(f"  rt_int args[{maxp}];")
         w("  uint8_t na = 0;")
@@ -807,6 +934,8 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
             if d.cfg.get("debounce"):
                 w(f"  db_v_{d.name} = db_c_{d.name} = i_raw_{d.name}();")
     w("  r_apply_safe();   /* safe state before anything else runs */")
+    if vm:
+        w("  VM_COPY(vm_img, vm_factory, sizeof(vm_factory)); vm_len = sizeof(vm_factory); vm_valid = true;")
     w("  uint32_t now = rt_now;")
     if bb:
         w("  " + BB(1, 0))
@@ -872,6 +1001,8 @@ def generate(ck: Checked, source_name: str = "<input>") -> str:
                 w(f"    if (c && !w_{i}) h_{i}();")
                 w(f"    w_{i} = c;")
             w("  }")
+    if node.paths:
+        w("  r_paths(now);")
     if anim:
         w(f"  if ((uint32_t)(now - t_anim) >= {ANIM_STEP_MS}UL) {{")
         w(f"    t_anim = ((uint32_t)(now - t_anim) >= {2 * ANIM_STEP_MS}UL) ? now : t_anim + {ANIM_STEP_MS}UL;")

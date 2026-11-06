@@ -1,4 +1,5 @@
 """Stage A3: arrays, structs and enums (generated C++ must behave exactly like the simulator)."""
+import os
 import unittest
 
 from test_rudrac import (ParityMixin, compile_src, have_gpp, messages, sim_event_lines, sim_tx_lines, wrap)
@@ -84,6 +85,7 @@ class A3Parity(ParityMixin, unittest.TestCase):
         sim = self.go("a3nobb", ["SET 7 1", "STATUS"], src)
         self.assertIn("STATUS 1", sim.tx)
 
+    @unittest.skipIf(os.environ.get("RUDRA_ENGINE") == "vm", "inspects the native C++ text")
     def test_proven_loop_indexes_use_no_runtime_check(self):
         from rudrac.gen import generate
         ck = compile_src(wrap(BASE, "nano", hb="heartbeat 100s"))

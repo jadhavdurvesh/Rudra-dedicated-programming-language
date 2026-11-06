@@ -13,18 +13,18 @@ with the compiled output, and an honest README entry. Nothing is "done" until it
 | A2 (done, v0.5) | `for i in 0..N` with constant bounds, `break` | a loop can never run unbounded; sim == C++ |
 | A3 (done, v0.7) | fixed-size arrays `int[16]`, `struct`, `enum` | index proved in range or checked at run time and counted; sim == C++ (151 tests) |
 | A4 (done, v0.6) | **worst-case prover**: max run time per handler and per main-loop pass, stack depth, RAM; refuse if over a declared `budget` | model-based; to be calibrated against real boards |
-| A5 | `import` / shared pin maps and interlock sets | two nodes share one definition |
-| A6 | motion words in the KRL/RAPID spirit: `move`, `speed`, `zone`, waypoints for steppers and motors | sequence tables, bounded |
+| A5 (done, v0.10) | `import` / shared pin maps and interlock sets | two nodes share one definition |
+| A6 (done, v0.11) | motion words in the KRL/RAPID spirit: `move`, `speed`, `zone`, waypoints for steppers and motors | sequence tables, bounded |
 
 ## Track B: the compiler
 
 | Stage | What | Exit test |
 |---|---|---|
 | B1 (done, v0.8) | one typed IR (`rudrac/ir.py`); simulator, C++ backend and prover all read it; `rudrac ir` prints it | one definition of "what the program means"; IR validator; golden-value tests (164 tests) |
-| B2 | bytecode backend + tiny VM for Nano and ESP32; update logic over serial without reflashing | same programs, same results as C++ backend |
-| B3 | formatter, language server (errors in the editor), `rudrac fmt` | |
-| B4 | written spec + conformance test suite | a second implementation could pass it |
-| B5 | direct machine code (AVR, Xtensa/RISC-V); self-hosting | late, optional |
+| B2 (done, v0.9) | bytecode backend + tiny VM for Nano and ESP32; update logic over serial without reflashing | same programs, same results as C++ backend |
+| B3 (done, v0.12) | formatter, language server (errors in the editor), `rudrac fmt` | formatter proves the tokens are unchanged, idempotent on every example; LSP session tested over a real pipe |
+| B4 (done, v0.12) | written spec + conformance test suite | `SPEC.md` + 34 cases in `conformance/`; reference passes on simulator, VM, C++ and VM C++; expectations can fail (tested) |
+| B5 (not started) | direct machine code (AVR, Xtensa/RISC-V); self-hosting | late, optional. Blocked on validation: this workspace has no avr-gcc, simavr or ESP toolchain, and an emulator I wrote myself would share my misreadings of the instruction set. Start only once step 5 of `BRINGUP.md` has real timing numbers and a real AVR emulator or board is available to test against. |
 
 ## Order
 

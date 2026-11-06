@@ -1,0 +1,10 @@
+// Shared by every node of the heater system: one pin map, one limit, one interlock, one helper.
+const FAN_PIN = 6
+const HEATER_PIN = 5
+const TEMP_LIMIT = 80
+func clamp(x: int, lo: int, hi: int) -> int {
+  if x < lo { return lo }
+  if x > hi { return hi }
+  return x
+}
+never heater and not fan        // the heater may never run without the fan, on ANY node that imports this

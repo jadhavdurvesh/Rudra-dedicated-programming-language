@@ -17,11 +17,11 @@ from .syntax import (IO, Var)
 from .util import ANIM_STEP_MS, TARGETS, US_PERIOD
 
 MODELS = {
-    "avr": dict(node=2, mul=8, div=48, var=1, dread=6, dwrite=6, awrite=12, aread=112, servo=15, tone=25,
+    "avr": dict(vm_op=6, node=2, mul=8, div=48, var=1, dread=6, dwrite=6, awrite=12, aread=112, servo=15, tone=25,
                 print_=22, i2c_byte=100, i2c_over=60, anim_px=25, fill_px=4, pixel=8, call=10, loop=3,
                 rx_poll=8, rx_parse=70, rx_arg=40, show_px=30, show_base=80, sonar_wait=25000, step_pulse=12,
                 sample=8, core_ram=200, stack_base=120, frame=10, board_ram=2048),
-    "esp": dict(node=1, mul=1, div=3, var=1, dread=2, dwrite=2, awrite=15, aread=40, servo=15, tone=25,
+    "esp": dict(vm_op=1, node=1, mul=1, div=3, var=1, dread=2, dwrite=2, awrite=15, aread=40, servo=15, tone=25,
                 print_=8, i2c_byte=100, i2c_over=40, anim_px=3, fill_px=1, pixel=2, call=4, loop=1,
                 rx_poll=3, rx_parse=25, rx_arg=15, show_px=30, show_base=80, sonar_wait=25000, step_pulse=8,
                 sample=3, core_ram=0, stack_base=400, frame=16, board_ram=0),
@@ -178,10 +178,13 @@ class _Analyzer:
         return total
 
 
-def analyze(ck, model_path: Optional[str] = None) -> CostReport:
+def analyze(ck, model_path: Optional[str] = None, vm: bool = False, vm_slack: int = 256) -> CostReport:
     node = ck.node
     family = TARGETS[node.target]["family"]
     m = load_model(family, model_path)
+    if vm:        # every expression node / statement becomes bytecode ops dispatched by the interpreter
+        op = m["vm_op"]
+        m.update(node=op, var=op, mul=op + m["mul"], div=op + m["div"], call=6 * op, loop=8 * op)
     a = _Analyzer(ck, m)
     rep = CostReport(model=m, family=family)
     ios = [d for d in node.decls if isinstance(d, IO)]
@@ -225,6 +228,10 @@ def analyze(ck, model_path: Optional[str] = None) -> CostReport:
             if not e.off:
                 hb_cost = safe_all + c
                 rep.items.append(("heartbeat (apply safe states + body)", hb_cost, False))
+        elif e.kind == "done":
+            # runs inside a pass, from the path engine, like a timer body
+            rep.items.append((f"done {e.name}", c, True))
+            timers += c
         else:
             rep.items.append((f"{e.kind}{where}", c, False))
     for f in node.fns:
@@ -242,6 +249,9 @@ def analyze(ck, model_path: Optional[str] = None) -> CostReport:
             fixed += m["awrite"] + m["dwrite"] + 8
         if d.kind == "stepper":
             fixed += m["step_pulse"] + 3 * m["dwrite"] + 6
+    for p in node.paths:        # every pass: look at the path; at most one waypoint is entered (one write) per pass
+        fixed += 6 * m["node"] + 4
+        timers += a.write_cost(a.ios[p.out])
     anim_cost = 0
     for d in strips:
         n = d.cfg["count"]
@@ -290,6 +300,8 @@ def analyze(ck, model_path: Optional[str] = None) -> CostReport:
             items.append((f"Servo {d.name}", 30))
     if any(d.kind == "i2c" for d in ios):
         items.append(("Wire library buffers", 130 if family == "avr" else 0))
+    for p in node.paths:
+        items.append((f"path {p.name} state", 9))
     for e in node.events:
         if e.kind == "every":
             items.append(("timer", 4))
@@ -302,9 +314,17 @@ def analyze(ck, model_path: Optional[str] = None) -> CostReport:
         items.append(("black box", 9 * node.blackbox + 12))
     if ck.states:
         items.append(("state", 1))
+    vm_stack_extra = 0
+    if vm:
+        from . import bytecode as B, genvm
+        img = B.assemble(ck)
+        cp = genvm.caps(img, vm_slack)
+        items.append(("bytecode image buffer (RAM)", cp["cap"]))
+        items.append(("VM value and local stacks", 4 * (cp["stack"] + cp["frame"])))
+        vm_stack_extra = 6 * cp["calls"] + 40
     rep.ram_items = items
     rep.ram_static = sum(b for _, b in items)
-    rep.stack = m["stack_base"] + stack_worst
+    rep.stack = m["stack_base"] + stack_worst + vm_stack_extra
     rep.board_ram = m["board_ram"]
     return rep
 
