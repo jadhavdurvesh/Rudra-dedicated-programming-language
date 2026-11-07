@@ -412,6 +412,15 @@ python3 -m rudrac conform                 # run conformance/ against the referen
   for a program that must be rejected). The reference passes them four ways: simulator, simulator through the bytecode VM, generated C++, generated `--vm` C++.
   The expected outputs came from the reference simulator; I checked the arithmetic and interlock ones by hand. A second implementation passing all 34 would agree with this one on those programs, not on every program.
 
+## Machine code for the Uno/Nano: first slice (v0.13, stage B5.1)
+
+`rudrac/avr/` holds an AVR assembler (`python3 -m rudrac avr file.S` writes an Intel HEX) and an ATmega328P emulator (CPU with exact flags and cycle counts,
+Timer0, UART, ports). `examples/avr/blink_raw.S` is a hand-written 282-byte blink. **This is not yet a compiler backend**: rudrac still compiles `.rudra`
+through C++ and `avr-gcc`. B5.1 only proves the lowest layer (instruction encodings, peripherals, timing) before code generation is built on it.
+`python3 -m rudrac upload file.hex -p COM3` is our own uploader (STK500 v1, what the Uno's bootloader speaks; needs `pip install pyserial`; tested against a fake bootloader only).
+The assembler is checked against opcode words from real avr-gcc listings, the emulator's arithmetic flags against the datasheet's boolean formulas for all
+65,536 operand pairs. Whether the real chip agrees is the open question: see `B5_TEST.md`.
+
 ## First run on a real board
 
 See [BRINGUP.md](BRINGUP.md): a step-by-step checklist (loads disconnected first), what to measure, and how to record differences from the simulator.
@@ -421,7 +430,7 @@ See [BRINGUP.md](BRINGUP.md): a step-by-step checklist (loads disconnected first
 ```
 python3 -m unittest discover -s tests -v
 ```
-253 tests. The heavy ones compile the **generated C++** with `g++ -Wall -Wextra -Werror` against a fake Arduino core (digital/PWM, servo, I2C, NeoPixel, serial),
+273 tests. The heavy ones compile the **generated C++** with `g++ -Wall -Wextra -Werror` against a fake Arduino core (digital/PWM, servo, I2C, NeoPixel, serial),
 replay seconds of inputs and commands, and compare every hardware effect and serial line **with its timestamp** against the simulator,
 for all examples, all four animation modes on Nano and ESP32 targets, the interlock examples, and every v0.4 feature (debounce, `when..for`, scoped states, motor ramp/limit/timeout, stepper, bus addressing and RS485 pin, black box).
 To check the tests are not vacuous, deliberate breakages were injected (animation maths, the interlock check, and eight v0.4 ones such as an off-by-one in debounce, ramp not passing through zero, broadcast answering, `goto` same state re-entering): all are caught.
@@ -443,3 +452,20 @@ The generated master-side C++ header is compiled and run, and the generated Pyth
 * v0.4 also fixed a v0.3 bug: handlers read `millis()` themselves while the loop used an earlier reading, so a 1 ms skew could wrap an unsigned subtraction (a false heartbeat trip or a garbled animation frame). Every timer now uses one clock reading per loop pass.
 * No SPI, UART peripherals or non-register I2C devices (displays, streaming IMUs) yet. ESP32-S3 pin rules are deliberately conservative.
 * The RAM and timing figures (`rudrac info`, `rudrac cost`) come from a model, not a measurement; see the v0.6 section for what it ignores.
+
+## Compiling straight to machine code: `rudrac cc` (v0.14, stages B5.2/B5.3)
+
+    rudrac cc examples/blink_uno.rudra --asm      # writes blink_uno.hex (+ .S); no avr-gcc, no Arduino IDE
+    rudrac upload blink_uno.hex COM3               # or XLoader / avrdude
+
+The backend handles Uno/Nano programs that use digital outputs, `every`, `start`, `on` (with integer arguments),
+`heartbeat`, `never`, `func`/`proc`, `var`/`let`, arrays, structs, enums, `if`, `for`, `break`, `send` and the
+built-in PING/WHO/STATUS. Anything else (inputs, `when`, states, pwm/servo/motor/stepper/neopixel/tone, paths,
+blackbox, bus) is refused with the list of reasons; use `rudrac build` for those. It is never compiled differently.
+
+How it is checked: the 32-bit helpers are compared with the Python reference arithmetic (edge values plus random
+pairs), and `tests/test_b5_gen.py` runs the generated machine code on the emulator next to the simulator and requires the
+same hardware writes in the same order, the same serial text and times within 4 ms. Known difference: serial sends
+block (about 1 ms per 11 characters at 115200), so a timer handler can run a fraction of a millisecond late.
+Caveat that still stands: the emulator is my own, so it shares any misreading of the datasheet. Nothing from this
+backend has run on a real board yet. `examples/avr/blink_rudra.hex` is the compiled `blink_uno.rudra`.
