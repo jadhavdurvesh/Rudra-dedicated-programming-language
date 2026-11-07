@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-VERSION = "0.12.0"
+VERSION = "0.14.0"
 US_PERIOD = 60   # ms between ultrasonic measurements
 
 

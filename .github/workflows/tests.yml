@@ -1,0 +1,74 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: core suite (${{ matrix.engine }} engine, py${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+        engine: [native, vm]
+    env:
+      RUDRA_ENGINE: ${{ matrix.engine }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install package
+        run: pip install .
+      - name: Run suite (excluding AVR emulator differential tests)
+        run: |
+          cd tests
+          ls test_*.py | grep -v -e test_b5_gen.py | sed 's/\.py$//' | xargs python -m unittest
+
+  avr-emulator:
+    name: AVR backend vs simulator (emulator)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - name: Assembler, emulator, uploader
+        run: cd tests && python -m unittest test_b5 test_b5_upload
+      - name: Helpers and generated code compared with the simulator
+        run: cd tests && python -m unittest test_b5_gen
+
+  conformance:
+    name: conformance suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - run: rudrac conform conformance
+      - name: Formatter leaves the examples unchanged
+        run: rudrac fmt --check examples/*.rudra
+
+  hex-up-to-date:
+    name: checked-in .hex files match their sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - name: Rebuild blink_rudra.hex and compare
+        run: |
+          rudrac cc examples/blink_uno.rudra -o /tmp/blink_rudra
+          diff /tmp/blink_rudra.hex examples/avr/blink_rudra.hex

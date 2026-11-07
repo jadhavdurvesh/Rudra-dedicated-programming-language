@@ -273,6 +273,76 @@ def cmd_fmt(a):
     return rc
 
 
+def cmd_avr(a):
+    from .avr.asm import AsmError, assemble, to_bytes, to_hex
+    try:
+        words = assemble(open(a.file, encoding="utf-8").read())
+    except AsmError as e:
+        print(f"{a.file}: {e}", file=sys.stderr)
+        return 1
+    out = a.out or os.path.splitext(a.file)[0] + ".hex"
+    with open(out, "w") as f:
+        f.write(to_hex(words))
+    print(f"wrote {out}  ({len(to_bytes(words))} bytes of flash)")
+    return 0
+
+
+def cmd_cc(a):
+    """.rudra -> Intel HEX through our own AVR backend (no avr-gcc, no Arduino)."""
+    from .avr.asm import AsmError, assemble, to_bytes, to_hex
+    from .avr.gen import AvrUnsupported, generate_asm
+    ck = load(a.file)
+    if ck is None:
+        return 1
+    if ck.node.target not in ("uno", "nano"):
+        print(f"{a.file}: the AVR backend only targets uno/nano, not {ck.node.target}", file=sys.stderr)
+        return 1
+    try:
+        text = generate_asm(ck)
+        words = assemble(text)
+    except AvrUnsupported as e:
+        print(f"{a.file}: not compilable by the AVR backend yet:", file=sys.stderr)
+        for r in e.reasons:
+            print(f"  - {r}", file=sys.stderr)
+        print("  (use `rudrac build` for the Arduino route)", file=sys.stderr)
+        return 1
+    except AsmError as e:
+        print(f"{a.file}: internal assembler error: {e}", file=sys.stderr)
+        return 2
+    base = a.out or os.path.splitext(a.file)[0]
+    with open(base + ".hex", "w") as f:
+        f.write(to_hex(words))
+    if a.asm:
+        with open(base + ".S", "w") as f:
+            f.write(text)
+    print(f"wrote {base}.hex  ({len(to_bytes(words))} bytes of flash)")
+    return 0
+
+
+def cmd_upload(a):
+    from .avr.upload import UploadError, parse_hex, Stk500
+    try:
+        import serial
+    except ImportError:
+        print("upload needs pyserial:  pip install pyserial", file=sys.stderr)
+        return 1
+    try:
+        mem = parse_hex(open(a.file, encoding="utf-8").read())
+        port = serial.Serial(a.port, a.baud, timeout=0.5)
+    except (UploadError, OSError, serial.SerialException) as e:
+        print(f"{a.file}: {e}", file=sys.stderr)
+        return 1
+    try:
+        Stk500(port).program(mem, progress=lambda i, n: print(f"\r  page {i}/{n}", end="", flush=True), verify=not a.no_verify)
+    except UploadError as e:
+        print(f"\nupload failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        port.close()
+    print(f"\nuploaded {len(mem)} bytes to {a.port}" + ("" if a.no_verify else " and verified them"))
+    return 0
+
+
 def cmd_conform(a):
     from . import conform
     root = a.dir or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conformance")
@@ -363,6 +433,24 @@ def main(argv=None):
     s.add_argument("--check", action="store_true", help="change nothing, exit 1 if a file would change")
     s.add_argument("--stdout", action="store_true", help="print instead of rewriting the file")
     s.set_defaults(fn=cmd_fmt)
+
+    s = sub.add_parser("avr", help="assemble AVR assembly (ATmega328P) to an Intel HEX file (stage B5, experimental)")
+    s.add_argument("file")
+    s.add_argument("-o", "--out")
+    s.set_defaults(fn=cmd_avr)
+
+    s = sub.add_parser("cc", help="compile a .rudra file straight to an Intel HEX file for an Uno/Nano (own backend, stage B5.3)")
+    s.add_argument("file")
+    s.add_argument("-o", "--out", help="output path without extension")
+    s.add_argument("--asm", action="store_true", help="also write the generated assembly (.S)")
+    s.set_defaults(fn=cmd_cc)
+
+    s = sub.add_parser("upload", help="send an Intel HEX file to an Uno/Nano through its bootloader (own avrdude; needs pyserial)")
+    s.add_argument("file")
+    s.add_argument("-p", "--port", required=True)
+    s.add_argument("-b", "--baud", type=int, default=115200, help="Uno 115200 (default); old Nano bootloader 57600")
+    s.add_argument("--no-verify", action="store_true")
+    s.set_defaults(fn=cmd_upload)
 
     s = sub.add_parser("conform", help="run the conformance suite (conformance/) against the reference implementation")
     s.add_argument("dir", nargs="?")

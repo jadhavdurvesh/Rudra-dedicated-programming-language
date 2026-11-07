@@ -1,0 +1,25 @@
+// First test on a real Arduino Uno: blink the on-board LED (pin 13) and answer the serial monitor.
+// Serial monitor at 115200 baud, line ending "Newline". Try:  PING  WHO  STATUS  FAST  SLOW  ON  OFF
+// No master here, so "heartbeat off": the LED keeps blinking by itself (the compiler makes you say so).
+node blink_uno target uno {
+  serial 115200
+  output led: digital(pin 13, safe false)
+  var half = 10          // half-period in 50 ms ticks: 10 -> 500 ms on, 500 ms off
+  var tick = 0
+  var blinking = true
+
+  start { send "READY" }      // prints READY once at boot, so the serial monitor shows something
+
+  every 50ms {
+    if blinking {
+      tick = tick + 1
+      if tick >= half { tick = 0  led = not led }
+    }
+  }
+  on FAST { half = 3 }
+  on SLOW { half = 10 }
+  on ON   { blinking = false  led = true }
+  on OFF  { blinking = false  led = false }
+  on BLINK { blinking = true }
+  heartbeat off
+}
