@@ -458,9 +458,9 @@ The generated master-side C++ header is compiled and run, and the generated Pyth
     rudrac cc examples/blink_uno.rudra --asm      # writes blink_uno.hex (+ .S); no avr-gcc, no Arduino IDE
     rudrac upload blink_uno.hex COM3               # or XLoader / avrdude
 
-The backend handles Uno/Nano programs that use digital outputs, `every`, `start`, `on` (with integer arguments),
+The backend handles Uno/Nano programs that use digital outputs, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, `every`, `start`, `on` (with integer arguments),
 `heartbeat`, `never`, `func`/`proc`, `var`/`let`, arrays, structs, enums, `if`, `for`, `break`, `send` and the
-built-in PING/WHO/STATUS. Anything else (inputs, `when`, states, pwm/servo/motor/stepper/neopixel/tone, paths,
+built-in PING/WHO/STATUS. Anything else (states, i2c/ultrasonic inputs, pwm/servo/motor/stepper/neopixel/tone, paths,
 blackbox, bus) is refused with the list of reasons; use `rudrac build` for those. It is never compiled differently.
 
 How it is checked: the 32-bit helpers are compared with the Python reference arithmetic (edge values plus random

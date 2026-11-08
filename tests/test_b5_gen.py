@@ -128,7 +128,27 @@ def diff(src, events, ms, tol=4):
     s.run(ms, events)
     m = AVR(assemble(generate_asm(ck)))
     m.set_sp(0x8FF)
-    m.run_ms(ms, [(t, (l + "\n").encode()) for t, k, l, _ in events if k == "rx"])
+    ios = {d.name: d for d in ck.node.decls if hasattr(d, "direction")}
+    ext = []
+
+    def pinkey(d):
+        c = str(d.pin.c)
+        n = 14 + int(c[1:]) if c[0] in "Aa" else int(c)
+        return ("D", n) if n <= 7 else (("B", n - 8) if n <= 13 else ("C", n - 14))
+
+    for d in ios.values():
+        if d.direction == "input" and d.kind == "digital":
+            port, bit = pinkey(d)
+            m.input_pins[port] |= (1 if d.invert else 0) << bit
+    for t, k, a, b in events:
+        if k == "set":
+            d = ios[a]
+            if d.kind == "digital":
+                port, bit = pinkey(d)
+                ext.append((t, "pin", f"{port}{bit}", 1 if bool(b) != d.invert else 0))
+            else:
+                ext.append((t, "adc", pinkey(d)[1], int(b)))
+    m.run_ms(ms + 1, [(t, (l + "\n").encode()) for t, k, l, _ in events if k == "rx"], ext_events=ext)
     # simulator writes -> changes only, per pin
     exp, last = [], {}
     for d in ck.node.decls:
@@ -164,14 +184,41 @@ class Generated(unittest.TestCase):
         import json
         done = 0
         for name in ("p01-digital-out", "p03-builtin-commands", "p06-never-interlock", "p14-func-proc-let-for-break",
-                     "p15-integer-arithmetic", "p16-arrays-structs-enums", "p22-multiple-heartbeat-recover"):
+                     "p05-when-for-and-debounce", "p15-integer-arithmetic", "p16-arrays-structs-enums", "p22-multiple-heartbeat-recover"):
             d = os.path.join(ROOT, "conformance", name)
             sc = json.load(open(os.path.join(d, "scenario.json")))
             ev = [(e[0], e[1], e[2], None) for e in sc["events"]]
             with self.subTest(name):
                 self.check_match(open(os.path.join(d, "prog.rudra")).read(), ev, min(sc["run_ms"], 6000))
                 done += 1
-        self.assertEqual(done, 7)
+        self.assertEqual(done, 8)
+
+    def test_analog_and_when(self):
+        src = """node t target uno {
+  input pot: analog(pin A1)
+  input btn: digital(pin 2, pullup, invert)
+  output led: digital(pin 13, safe false)
+  output buz: digital(pin 8, safe false)
+  var hits = 0
+  when pot > 600 { led = true  send "HI", pot }
+  when pot <= 600 { led = false }
+  when btn { hits = hits + 1  send "HIT", hits }
+  when btn for 300ms { buz = true }
+  when not btn { buz = false }
+  every 250ms { send "P", pot }
+  on READ { send "R", pot }
+  heartbeat off
+}"""
+        ev = [(50, "set", "pot", 100), (400, "set", "pot", 700), (700, "set", "pot", 1023), (900, "set", "pot", 0),
+              (950, "rx", "READ", None), (1000, "set", "btn", True), (1100, "set", "btn", False), (1200, "set", "btn", True),
+              (1600, "set", "btn", False), (1650, "set", "pot", 601), (1800, "set", "pot", 600)]
+        m = self.check_match(src, ev, 2500)
+        self.assertIn("HI 700", m.tx_text())
+
+    def test_inputs_refused_kinds(self):
+        src = "node n target uno { serial 9600\n input d: ultrasonic(trig 3, echo 4)\n output l: digital(pin 13, safe false)\n heartbeat off }"
+        with self.assertRaises(AvrUnsupported):
+            generate_asm(build(src))
 
     def test_cli_cc(self):
         import subprocess, tempfile
@@ -185,10 +232,10 @@ class Generated(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
 
     def test_refuses_unsupported(self):
-        src = "node n target uno { serial 9600\n input b: digital(pin 2)\n output l: digital(pin 13, safe false)\n heartbeat off }"
+        src = "node n target uno { serial 9600\n output l: pwm(pin 9, safe 0)\n heartbeat off }"
         with self.assertRaises(AvrUnsupported) as c:
             generate_asm(build(src))
-        self.assertIn("input", c.exception.reasons[0])
+        self.assertIn("pwm", c.exception.reasons[0])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ SREG_C, SREG_Z, SREG_N, SREG_V, SREG_S, SREG_H, SREG_T, SREG_I = range(8)
 PINB, DDRB, PORTB = 0x23, 0x24, 0x25
 PINC, DDRC, PORTC = 0x26, 0x27, 0x28
 PIND, DDRD, PORTD = 0x29, 0x2A, 0x2B
+ADCL, ADCH, ADCSRA, ADMUX = 0x78, 0x79, 0x7A, 0x7C
 TIFR0, TCCR0A, TCCR0B, TCNT0, OCR0A = 0x35, 0x44, 0x45, 0x46, 0x47
 TIMSK0 = 0x6E
 UCSR0A, UCSR0B, UCSR0C, UBRR0L, UBRR0H, UDR0 = 0xC0, 0xC1, 0xC2, 0xC4, 0xC5, 0xC6
@@ -48,6 +49,8 @@ class AVR:
         self.tx_log: List[Tuple[float, int]] = []             # (ms, byte)
         self.rx: List[int] = []
         self.sleeping = False
+        self.adc = [0] * 8                                    # voltages (0..1023) the outside world puts on ADC0..7
+        self.adc_done = 0                                     # cycle at which the running conversion finishes (0 = idle)
         self.input_pins = {"B": 0, "C": 0, "D": 0}            # levels the outside world drives (read via PINx)
 
     # ------------------------------------------------------------------ memory-mapped I/O
@@ -64,6 +67,16 @@ class AVR:
             port = {PINB: "B", PINC: "C", PIND: "D"}[a]
             ddr, out = self.mem[a + 1], self.mem[a + 2]
             return (out & ddr) | (self.input_pins[port] & ~ddr & 0xFF)
+        if a == ADCSRA:
+            if self.adc_done and self.cycles >= self.adc_done:
+                self.adc_done = 0
+                self.mem[ADCSRA] &= ~0x40 & 0xFF
+                ch = self.mem[ADMUX] & 15
+                v = self.adc[ch] if ch < 8 else 0
+                self.mem[ADCL], self.mem[ADCH] = v & 255, v >> 8
+            return self.mem[ADCSRA]
+        if a in (ADCL, ADCH, ADMUX):
+            return self.mem[a]
         if a == UCSR0A:
             v = self.mem[a] & ~0x80 & 0xFF
             if self.rx:
@@ -100,6 +113,15 @@ class AVR:
         elif a == UDR0:
             self.tx.append(v)
             self.tx_log.append((self.ms, v))
+        elif a == ADCSRA:
+            was = self.mem[ADCSRA]
+            if not v & 0x80:
+                self.adc_done = 0                             # ADC disabled: no conversion
+            elif v & 0x40 and not was & 0x40:
+                self.adc_done = self.cycles + 13 * 2 ** max(1, v & 7)   # 13 ADC clocks at the chosen prescaler
+            self.mem[ADCSRA] = v & ~0x10 & 0xFF
+        elif a == ADMUX:
+            self.mem[a] = v
         elif a == TIFR0:
             self.mem[a] &= ~v & 0xFF                          # flags clear by writing a one
         elif a == TCNT0:
@@ -459,15 +481,27 @@ class AVR:
         return 2
 
     # ------------------------------------------------------------------ driving it
-    def run_ms(self, ms: float, rx_events: Optional[List[Tuple[float, bytes]]] = None, max_steps: int = 500_000_000):
+    def run_ms(self, ms: float, rx_events: Optional[List[Tuple[float, bytes]]] = None, max_steps: int = 500_000_000,
+               ext_events: Optional[List[Tuple[float, str, int, int]]] = None):
+        """ext_events: (ms, 'pin', 'B5', level) sets an input pin; (ms, 'adc', channel, value) sets an ADC voltage."""
         end = self.cycles + int(ms * F_CPU / 1000)
         ev = sorted(rx_events or [], key=lambda e: e[0])
+        xe = sorted(ext_events or [], key=lambda e: e[0])
+        xk = 0
         k = 0
         steps = 0
         while self.cycles < end:
             while k < len(ev) and ev[k][0] <= self.ms:
                 self.rx.extend(ev[k][1])
                 k += 1
+            while xk < len(xe) and xe[xk][0] <= self.ms:
+                _, kind, a, b = xe[xk]
+                if kind == "pin":
+                    port, bit = a[0], int(a[1:])
+                    self.input_pins[port] = (self.input_pins[port] & ~(1 << bit) & 0xFF) | (b << bit)
+                else:
+                    self.adc[a] = b
+                xk += 1
             self.step()
             steps += 1
             if steps > max_steps:
