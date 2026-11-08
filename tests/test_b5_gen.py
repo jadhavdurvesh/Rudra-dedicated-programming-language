@@ -293,6 +293,12 @@ class Generated(unittest.TestCase):
                                cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(r.returncode, 1)
 
+    def test_checked_in_hex_is_current(self):
+        src = open(os.path.join(ROOT, "examples", "blink_uno.rudra")).read()
+        hexed = compile_hex(build(src))[1]
+        self.assertEqual(hexed, open(os.path.join(ROOT, "examples", "avr", "blink_rudra.hex")).read(),
+                         "run: rudrac cc examples/blink_uno.rudra -o examples/avr/blink_rudra --asm")
+
     def test_refuses_unsupported(self):
         src = "node n target uno { serial 9600\n output l: pwm(pin 9, safe 0)\n heartbeat off }"
         with self.assertRaises(AvrUnsupported) as c:
