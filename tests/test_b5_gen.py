@@ -22,6 +22,11 @@ STUB = ".org 0\n        jmp entry\n.org 0x40\nentry:\n        rjmp .\ndone:\n   
 EDGE = [0, 1, -1, 2, -2, 3, 7, 10, -10, 255, 256, 65535, 65536, 2**31 - 1, -2**31, -2**31 + 1, 123456789, -987654321]
 
 
+# The emulated chip's 1 ms clock ticks a few microseconds after each nominal millisecond; an outside event is placed
+# half a millisecond later so it is seen on the same tick as in the simulator (a real master is never that exact anyway).
+PHASE = 0.5
+
+
 def u32(x):
     return x & 0xFFFFFFFF
 
@@ -145,10 +150,10 @@ def diff(src, events, ms, tol=4):
             d = ios[a]
             if d.kind == "digital":
                 port, bit = pinkey(d)
-                ext.append((t, "pin", f"{port}{bit}", 1 if bool(b) != d.invert else 0))
+                ext.append((t + PHASE, "pin", f"{port}{bit}", 1 if bool(b) != d.invert else 0))
             else:
-                ext.append((t, "adc", pinkey(d)[1], int(b)))
-    m.run_ms(ms + 1, [(t, (l + "\n").encode()) for t, k, l, _ in events if k == "rx"], ext_events=ext)
+                ext.append((t + PHASE, "adc", pinkey(d)[1], int(b)))
+    m.run_ms(ms + 1, [(t + PHASE, (l + "\n").encode()) for t, k, l, _ in events if k == "rx"], ext_events=ext)
     # simulator writes -> changes only, per pin
     exp, last = [], {}
     for d in ck.node.decls:
@@ -176,22 +181,22 @@ class Generated(unittest.TestCase):
 
     def test_blink_example(self):
         src = open(os.path.join(ROOT, "examples", "blink_uno.rudra")).read()
-        ev = [(100, "rx", "PING", None), (300, "rx", "FAST", None), (1500, "rx", "WHO", None), (2500, "rx", "ON", None),
-              (3000, "rx", "STATUS", None), (3200, "rx", "BOGUS", None), (3500, "rx", "BLINK", None), (4000, "rx", "SLOW", None)]
+        ev = [(107, "rx", "PING", None), (307, "rx", "FAST", None), (1507, "rx", "WHO", None), (2507, "rx", "ON", None),
+              (3007, "rx", "STATUS", None), (3207, "rx", "BOGUS", None), (3507, "rx", "BLINK", None), (4007, "rx", "SLOW", None)]
         self.check_match(src, ev, 7000)
 
     def test_conformance_programs(self):
         import json
         done = 0
         for name in ("p01-digital-out", "p03-builtin-commands", "p06-never-interlock", "p14-func-proc-let-for-break",
-                     "p05-when-for-and-debounce", "p15-integer-arithmetic", "p16-arrays-structs-enums", "p22-multiple-heartbeat-recover"):
+                     "p05-when-for-and-debounce", "p13-states", "p15-integer-arithmetic", "p16-arrays-structs-enums", "p22-multiple-heartbeat-recover"):
             d = os.path.join(ROOT, "conformance", name)
             sc = json.load(open(os.path.join(d, "scenario.json")))
             ev = [(e[0], e[1], e[2], None) for e in sc["events"]]
             with self.subTest(name):
                 self.check_match(open(os.path.join(d, "prog.rudra")).read(), ev, min(sc["run_ms"], 6000))
                 done += 1
-        self.assertEqual(done, 8)
+        self.assertEqual(done, 9)
 
     def test_analog_and_when(self):
         src = """node t target uno {
@@ -210,10 +215,67 @@ class Generated(unittest.TestCase):
   heartbeat off
 }"""
         ev = [(50, "set", "pot", 100), (400, "set", "pot", 700), (700, "set", "pot", 1023), (900, "set", "pot", 0),
-              (950, "rx", "READ", None), (1000, "set", "btn", True), (1100, "set", "btn", False), (1200, "set", "btn", True),
-              (1600, "set", "btn", False), (1650, "set", "pot", 601), (1800, "set", "pot", 600)]
+              (950, "rx", "READ", None), (1010, "set", "btn", True), (1110, "set", "btn", False), (1210, "set", "btn", True),
+              (1610, "set", "btn", False), (1650, "set", "pot", 601), (1800, "set", "pot", 600)]
         m = self.check_match(src, ev, 2500)
         self.assertIn("HI 700", m.tx_text())
+
+    def test_states_full(self):
+        src = """node t target uno {
+  input btn: digital(pin 2, pullup, invert, debounce 20ms)
+  output a: digital(pin 12, safe false)
+  output b: digital(pin 13, safe false)
+  var n = 0
+  state idle {
+    enter { a = false  send "IDLE" }
+    exit  { send "LEAVE-IDLE" }
+    on SET(x) { n = x  send "I", n }
+    on GO { goto run }
+    when btn { goto run }
+  }
+  state run {
+    enter { b = true  n = 0  send "RUN" }
+    exit  { b = false }
+    every 100ms { n = n + 1  a = not a  if n >= 5 { goto done } }
+    on SET(x) { send "BUSY" }
+    on STOP { goto idle }
+  }
+  state done {
+    enter { send "DONE", n  a = true }
+    when true for 300ms { goto idle }
+  }
+  on SET(x) { send "G", x }
+  on PING2 { send "P2" }
+  heartbeat off
+}"""
+        ev = [(50, "rx", "SET 7", None), (100, "rx", "SET", None), (150, "rx", "STATE", None), (200, "rx", "GO", None),
+              (250, "rx", "SET 9", None), (750, "rx", "STATE", None), (1400, "rx", "PING2", None), (1500, "rx", "SET -3", None),
+              (1600, "set", "btn", True), (1800, "set", "btn", False), (2100, "rx", "STOP", None),
+              (2200, "rx", "GO", None), (2350, "rx", "STOP", None), (2450, "rx", "STOP", None), (2500, "rx", "NOPE", None)]
+        m = self.check_match(src, ev, 4000)
+        self.assertIn("DONE 5", m.tx_text())
+        self.assertIn("LEAVE-IDLE", m.tx_text())
+
+    def test_state_entry_resets_timers(self):
+        src = """node t target uno {
+  input btn: digital(pin 2, pullup, invert)
+  output a: digital(pin 12, safe false)
+  state one {
+    enter { send "ONE" }
+    when btn { send "EDGE1"  goto two }
+    when btn for 200ms { send "HELD1" }
+    every 300ms { a = not a }
+  }
+  state two {
+    enter { send "TWO" }
+    on BACK { goto one }
+  }
+  heartbeat off
+}"""
+        ev = [(105, "set", "btn", True), (400, "rx", "BACK", None), (650, "rx", "BACK", None), (1000, "rx", "BACK", None),
+              (1210, "set", "btn", False), (1450, "set", "btn", True), (1700, "rx", "BACK", None), (2100, "rx", "BACK", None)]
+        m = self.check_match(src, ev, 3000)
+        self.assertGreaterEqual(m.tx_text().count("EDGE1"), 3)
 
     def test_inputs_refused_kinds(self):
         src = "node n target uno { serial 9600\n input d: ultrasonic(trig 3, echo 4)\n output l: digital(pin 13, safe false)\n heartbeat off }"

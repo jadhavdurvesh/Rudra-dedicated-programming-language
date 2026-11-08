@@ -458,9 +458,9 @@ The generated master-side C++ header is compiled and run, and the generated Pyth
     rudrac cc examples/blink_uno.rudra --asm      # writes blink_uno.hex (+ .S); no avr-gcc, no Arduino IDE
     rudrac upload blink_uno.hex COM3               # or XLoader / avrdude
 
-The backend handles Uno/Nano programs that use digital outputs, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, `every`, `start`, `on` (with integer arguments),
+The backend handles Uno/Nano programs that use digital outputs, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
 `heartbeat`, `never`, `func`/`proc`, `var`/`let`, arrays, structs, enums, `if`, `for`, `break`, `send` and the
-built-in PING/WHO/STATUS. Anything else (states, i2c/ultrasonic inputs, pwm/servo/motor/stepper/neopixel/tone, paths,
+built-in PING/WHO/STATUS. Anything else (i2c/ultrasonic inputs, pwm/servo/motor/stepper/neopixel/tone, paths,
 blackbox, bus) is refused with the list of reasons; use `rudrac build` for those. It is never compiled differently.
 
 How it is checked: the 32-bit helpers are compared with the Python reference arithmetic (edge values plus random
@@ -469,3 +469,8 @@ same hardware writes in the same order, the same serial text and times within 4 
 block (about 1 ms per 11 characters at 115200), so a timer handler can run a fraction of a millisecond late.
 Caveat that still stands: the emulator is my own, so it shares any misreading of the datasheet. Nothing from this
 backend has run on a real board yet. `examples/avr/blink_rudra.hex` is the compiled `blink_uno.rudra`.
+
+Differential-test note (v0.16): the emulated chip's 1 ms clock ticks a few microseconds after each nominal millisecond, so
+`tests/test_b5_gen.py` places outside events (serial lines, pin changes) half a millisecond after the simulator's
+tick, and avoids scenarios where an outside event lands on the same tick as a timer; the simulator orders those as
+"serial line first, then timers", which a real master cannot rely on either.

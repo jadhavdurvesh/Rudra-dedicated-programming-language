@@ -74,13 +74,11 @@ def unsupported(ck: Checked) -> List[str]:
         why.append("blackbox")
     if node.paths:
         why.append("paths")
-    if ck.states:
-        why.append("states")
     for e in node.events:
-        if e.kind not in ("every", "on", "heartbeat", "start", "when"):
+        if e.kind not in ("every", "on", "heartbeat", "start", "when", "enter", "exit"):
             why.append(f"'{e.kind}' handlers")
     low = I.Lowerer(ck)
-    bad_stmt = (I.FillS, I.PixelS, I.AnimS, I.GotoS, I.RunS, I.StopS, I.CancelS)
+    bad_stmt = (I.FillS, I.PixelS, I.AnimS, I.RunS, I.StopS, I.CancelS)
 
     def ex(e):
         if isinstance(e, I.Running):
@@ -96,7 +94,7 @@ def unsupported(ck: Checked) -> List[str]:
         if isinstance(s, bad_stmt):
             why.append(type(s).__name__.replace("S", "", 1).lower() + " statements")
 
-    bodies = [low.body(e.body, e.params) for e in node.events if e.kind in ("every", "on", "heartbeat", "start", "when")]
+    bodies = [low.body(e.body, e.params) for e in node.events if e.kind in ("every", "on", "heartbeat", "start", "when", "enter", "exit")]
     for e in node.events:
         if e.kind == "when":
             ex(low.expr(e.arg))
@@ -357,6 +355,9 @@ class Gen:
             if s.e is not None:
                 self.ex(s.e)
             self.w("ret")
+        elif isinstance(s, I.GotoS):
+            self.w(f"ldi r16, {s.index}")
+            self.w("call r_goto")
         elif isinstance(s, I.Brk):
             self.w(f"jmp {self.loop_exits[-1]}")
         elif isinstance(s, I.CallS):
@@ -419,7 +420,7 @@ class Gen:
         node, ck = self.node, self.ck
         # runtime state
         for n, size in (("NOW", 4), ("NOWC", 4), ("HBLAST", 4), ("HBTRIP", 1), ("BLOCKED", 4), ("RXHEAD", 1),
-                        ("RXTAIL", 1), ("RXLEN", 1), ("RXDROP", 1), ("RXNAME", 2), ("NA", 1)):
+                        ("ST", 1), ("RXTAIL", 1), ("RXLEN", 1), ("RXDROP", 1), ("RXNAME", 2), ("NA", 1)):
             self.alloc(n, size)
         self.alloc("RXRING", RX_RING)
         self.alloc("RXBUF", RX_MAX)
@@ -523,6 +524,10 @@ class Gen:
         w("sei")
         for i, e in self.events:
             if e.kind == "start":
+                w(f"call h_{i}")
+        first = next(iter(ck.state_index), None)
+        for i, e in self.events:
+            if e.kind == "enter" and e.state == first:
                 w(f"call h_{i}")
         w("jmp main_loop")
 
@@ -715,6 +720,54 @@ class Gen:
             w("sts HBTRIP, r2")
         w("ret")
 
+        if ck.states:
+            w("r_goto:                       ; r16 = new state index")
+            w("lds r17, ST")
+            w("cp r17, r16")
+            w("brne rg_go")
+            w("ret")
+            w("rg_go:")
+            w("push r16")
+            for i, e in self.events:
+                if e.kind == "exit":
+                    sk = self.lab("Lg")
+                    w("lds r16, ST")
+                    w(f"cpi r16, {ck.state_index[e.state]}")
+                    w(f"brne {sk}")
+                    w(f"call h_{i}")
+                    w(f"{sk}:")
+            w("pop r16")
+            w("push r16")
+            w("sts ST, r16")
+            for name, k in ck.state_index.items():
+                items = [(i, e) for i, e in self.events if e.state == name and e.kind in ("every", "when")]
+                if not items:
+                    continue
+                sk = self.lab("Lg")
+                w(f"cpi r16, {k}")
+                w(f"brne {sk}")
+                for i, e in items:
+                    if e.kind == "every":
+                        self.load("NOWC")
+                        self.store(f"T_{i}")
+                    else:
+                        w(f"sts W_{i}, r2")
+                        w(f"sts WO_{i}, r2")
+                w(f"{sk}:")
+                w("pop r16")
+                w("push r16")
+            for i, e in self.events:
+                if e.kind == "enter":
+                    sk = self.lab("Lg")
+                    w("pop r16")
+                    w("push r16")
+                    w(f"cpi r16, {ck.state_index[e.state]}")
+                    w(f"brne {sk}")
+                    w(f"call h_{i}")
+                    w(f"{sk}:")
+            w("pop r16")
+            w("ret")
+
         # --- functions and handlers
         for f in ck.fns:
             self.owner = f"f_{f.name}"
@@ -722,7 +775,7 @@ class Gen:
             self.block(self.low.fn_body(f.name))
             w("ret")
         for i, e in self.events:
-            if e.kind not in ("every", "on", "heartbeat", "start", "when"):
+            if e.kind not in ("every", "on", "heartbeat", "start", "when", "enter", "exit"):
                 continue
             self.owner = f"h{i}"
             w(f"h_{i}:   ; {e.kind} {e.name or ''}")
@@ -802,6 +855,10 @@ class Gen:
             if e.kind != "every":
                 continue
             skip, plus, run = self.lab("Lk"), self.lab("Lk"), self.lab("Lk")
+            if e.state is not None:
+                w("lds r16, ST")
+                w(f"cpi r16, {self.ck.state_index[e.state]}")
+                self.br_far("brne", skip)
             self.load("NOWC")
             self.load(f"T_{i}", 18)
             w("call sub32")
@@ -832,6 +889,10 @@ class Gen:
         w = self.w
         self.owner = f"w{i}"
         no, done = self.lab("Lc"), self.lab("Ld")
+        if e.state is not None:
+            w("lds r16, ST")
+            w(f"cpi r16, {self.ck.state_index[e.state]}")
+            self.br_far("brne", done)
         self.ex(self.low.expr(e.arg))
         self.test_a()
         self.br_far("breq", no)
@@ -1054,14 +1115,26 @@ class Gen:
         cmd("PING", ping)
         cmd("WHO", who)
         cmd("STATUS", status)
+        if self.ck.states:
+            def state_cmd():
+                w("call rt_heard")
+                reply("STATE ")
+                w("lds r22, ST")
+                w("clr r23")
+                w("clr r24")
+                w("clr r25")
+                w("call tx_i32")
+                w("call tx_crlf")
+            cmd("STATE", state_cmd)
         seen = set()
-        for i, e in events:
-            if e.kind != "on" or e.name in seen:
+        for i0, e0 in events:
+            if e0.kind != "on" or e0.name in seen:
                 continue
-            seen.add(e.name)
-            n = len(e.params)
+            seen.add(e0.name)
+            hs = [(i, e) for i, e in events if e.kind == "on" and e.name == e0.name]
+            n = len(e0.params)
 
-            def act(i=i, e=e, n=n):
+            def act(hs=hs, n=n, e0=e0):
                 if n:
                     ok = self.lab("Lc")
                     w("lds r16, NA")
@@ -1071,13 +1144,32 @@ class Gen:
                     w("call tx_crlf")
                     w("ret")
                     w(f"{ok}:")
+
+                def run(i, e):
+                    w("call rt_heard")
                     for k, p in enumerate(e.params):
                         self.load("ARGS", 22, 4 * k)
                         self.store(f"S_h{i}_{p}")
-                w("call rt_heard")
-                w(f"call h_{i}")
+                    w(f"call h_{i}")
+                    w("ret")
+                for i, e in hs:
+                    if e.state is None:
+                        continue
+                    sk = self.lab("Lc")
+                    w("lds r16, ST")
+                    w(f"cpi r16, {self.ck.state_index[e.state]}")
+                    w(f"brne {sk}")
+                    run(i, e)
+                    w(f"{sk}:")
+                glob = next(((i, e) for i, e in hs if e.state is None), None)
+                if glob:
+                    run(*glob)
+                else:
+                    reply("ERR")
+                    w("call tx_crlf")
+                    w("ret")
 
-            cmd(e.name, act)
+            cmd(e0.name, act)
         reply("ERR")
         w("call tx_crlf")
         w("ret")
