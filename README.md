@@ -458,7 +458,7 @@ The generated master-side C++ header is compiled and run, and the generated Pyth
     rudrac cc examples/blink_uno.rudra --asm      # writes blink_uno.hex (+ .S); no avr-gcc, no Arduino IDE
     rudrac upload blink_uno.hex COM3               # or XLoader / avrdude
 
-The backend handles Uno/Nano programs that use digital, pwm (pins 3, 9, 10, 11), servo (up to 4), motor, and stepper outputs, black box (LOG), digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
+The backend handles Uno/Nano programs that use digital, pwm (pins 3, 9, 10, 11), servo (up to 4), motor, and stepper outputs, black box (LOG), paths, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
 `heartbeat`, `never`, `func`/`proc`, `var`/`let`, arrays, structs, enums, `if`, `for`, `break`, `send` and the
 built-in PING/WHO/STATUS. Anything else (i2c/ultrasonic inputs, pwm on pins 5/6 (Timer0 runs the clock), motor/stepper/neopixel/tone, paths,
 blackbox, bus) is refused with the list of reasons; use `rudrac build` for those. It is never compiled differently.
@@ -483,4 +483,10 @@ width on the emulated pin and compared with the simulator's angle sequence.
 Motors and steppers (v0.18): a motor's PWM pins must be 3, 9, 10 or 11. Ramp and timeout run every 20 ms exactly as in the
 simulator; steppers step on their own interval with a pulse of about 1 us, and keep stepping while the heartbeat has
 tripped (towards the safe position). The black box is a RAM ring buffer (9 bytes per entry, up to 64 entries), read
-back with LOG, like the simulator. Paths are still refused.
+back with LOG, like the simulator. Paths run on the same 1-pass-per-loop engine as the simulator.
+
+Paths (v0.19): one pass of the path engine runs per main-loop pass after the event handlers, like the simulator's one per
+millisecond. The chip makes many passes per millisecond, so a chain "arrive, wait, next waypoint" can finish up to a
+millisecond earlier than in the simulator; for a stepper that can move its step grid by one step interval. The
+differential test for paths therefore allows 12 ms of timing slack but still requires the same write order, values and
+serial text.

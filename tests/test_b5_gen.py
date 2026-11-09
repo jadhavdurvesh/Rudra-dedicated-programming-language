@@ -382,6 +382,52 @@ class Generated(unittest.TestCase):
         m = self.check_match(src, ev, 1500)
         self.assertIn("LOG ", m.tx_text())
 
+    def test_paths_stepper_and_motor(self):
+        src = """node t target uno {
+  output pan: stepper(step 8, dir 12, rate 200, safe 0)
+  output drive: motor(pwm 11, dir 4, ramp 600, safe 0)
+  path sweep for pan {
+    at 20 speed 500 zone 2
+    at 5 speed 100 wait 300
+    at 0
+    repeat 2
+  }
+  path pulse for drive { at 60 wait 300
+    at -40 wait 100
+    repeat 2 }
+  path spin for pan { at 9 speed 50 }
+  on GO { run sweep }
+  on GOM { run pulse }
+  on SPIN { run spin }
+  on DIRECT(v) { pan = v }
+  on HALT { stop pan  stop drive }
+  on Q { send "R", sweep  send "M", pulse  send "P", pan }
+  done sweep { send "DONE" }
+  done pulse { send "DONEM" }
+  heartbeat 100s
+}"""
+        ev = [(107, "rx", "GO", None), (153, "rx", "Q", None), (1503, "rx", "Q", None), (1707, "rx", "GOM", None),
+              (1907, "rx", "Q", None), (2307, "rx", "Q", None), (3007, "rx", "GO", None), (3257, "rx", "HALT", None),
+              (3307, "rx", "Q", None), (3507, "rx", "SPIN", None), (3753, "rx", "DIRECT 3", None), (3957, "rx", "Q", None),
+              (4503, "rx", "GOM", None), (4757, "rx", "GO", None), (4807, "rx", "SPIN", None), (6003, "rx", "Q", None)]
+        # The simulator makes one pass per millisecond, the chip makes many, so a chain "arrive -> wait -> next point" can run
+        # up to a millisecond earlier on the chip, which shifts the stepper's step grid by up to one step interval (10 ms here).
+        m = self.check_match(src, ev, 7000, tol=12)
+        self.assertIn("DONE", m.tx_text())
+        self.assertIn("DONEM", m.tx_text())
+
+    def test_path_heartbeat_ends_path(self):
+        src = """node t target uno {
+  output pan: stepper(step 8, dir 12, rate 100, safe 0)
+  path p for pan { at 400 speed 100 }
+  on GO { run p }
+  on Q { send "R", p  send "P", pan }
+  heartbeat 1s
+}"""
+        ev = [(107, "rx", "GO", None), (503, "rx", "Q", None), (1113, "rx", "Q", None), (1503, "rx", "Q", None),
+              (1807, "rx", "GO", None), (2203, "rx", "Q", None), (3303, "rx", "Q", None)]
+        self.check_match(src, ev, 4000)
+
     def test_pwm_timer1_and_refusals(self):
         src = "node t target uno { output a: pwm(pin 9, safe 0)\n output b: pwm(pin 10, safe 100)\n on X(v) { a = v  b = 100 - v }\n heartbeat off }"
         self.check_match(src, [(105, "rx", "X 30", None), (305, "rx", "X 99", None), (505, "rx", "X 100", None), (705, "rx", "X 0", None)], 1000)
