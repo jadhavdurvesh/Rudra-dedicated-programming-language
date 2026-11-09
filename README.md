@@ -458,9 +458,9 @@ The generated master-side C++ header is compiled and run, and the generated Pyth
     rudrac cc examples/blink_uno.rudra --asm      # writes blink_uno.hex (+ .S); no avr-gcc, no Arduino IDE
     rudrac upload blink_uno.hex COM3               # or XLoader / avrdude
 
-The backend handles Uno/Nano programs that use digital outputs, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
+The backend handles Uno/Nano programs that use digital, pwm (pins 3, 9, 10, 11) and servo (up to 4) outputs, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
 `heartbeat`, `never`, `func`/`proc`, `var`/`let`, arrays, structs, enums, `if`, `for`, `break`, `send` and the
-built-in PING/WHO/STATUS. Anything else (i2c/ultrasonic inputs, pwm/servo/motor/stepper/neopixel/tone, paths,
+built-in PING/WHO/STATUS. Anything else (i2c/ultrasonic inputs, pwm on pins 5/6 (Timer0 runs the clock), motor/stepper/neopixel/tone, paths,
 blackbox, bus) is refused with the list of reasons; use `rudrac build` for those. It is never compiled differently.
 
 How it is checked: the 32-bit helpers are compared with the Python reference arithmetic (edge values plus random
@@ -474,3 +474,8 @@ Differential-test note (v0.16): the emulated chip's 1 ms clock ticks a few micro
 `tests/test_b5_gen.py` places outside events (serial lines, pin changes) half a millisecond after the simulator's
 tick, and avoids scenarios where an outside event lands on the same tick as a timer; the simulator orders those as
 "serial line first, then timers", which a real master cannot rely on either.
+
+PWM and servo (v0.17): PWM runs at about 976 Hz (fast PWM, clock/64) and, like Arduino's analogWrite, a duty of 0 or 255
+is a plain digital write. Servo pulses come from Timer1 in slots (each servo gets its own slot of a 20 ms frame); angle
+to pulse width follows the Servo library (544..2400 us). In the tests a servo angle is read back from the measured pulse
+width on the emulated pin and compared with the simulator's angle sequence.
