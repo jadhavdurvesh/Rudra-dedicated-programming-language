@@ -20,6 +20,13 @@ TIFR0, TCCR0A, TCCR0B, TCNT0, OCR0A = 0x35, 0x44, 0x45, 0x46, 0x47
 TIMSK0 = 0x6E
 UCSR0A, UCSR0B, UCSR0C, UBRR0L, UBRR0H, UDR0 = 0xC0, 0xC1, 0xC2, 0xC4, 0xC5, 0xC6
 SPL, SPH, SREG = 0x5D, 0x5E, 0x5F
+TIFR1, TIFR2, TIMSK1, TIMSK2 = 0x36, 0x37, 0x6F, 0x70
+TCCR1A, TCCR1B, TCCR1C, TCNT1L, TCNT1H, ICR1L, ICR1H = 0x80, 0x81, 0x82, 0x84, 0x85, 0x86, 0x87
+OCR1AL, OCR1AH, OCR1BL, OCR1BH = 0x88, 0x89, 0x8A, 0x8B
+TCCR2A, TCCR2B, TCNT2, OCR2A, OCR2B = 0xB0, 0xB1, 0xB2, 0xB3, 0xB4
+T1_16BIT = {TCNT1L: TCNT1H, ICR1L: ICR1H, OCR1AL: OCR1AH, OCR1BL: OCR1BH}   # low address -> high address
+TIMER1_COMPA_VECTOR = 0x16
+TIMER1_COMPB_VECTOR = 0x18
 TIMER0_COMPA_VECTOR = 0x1C     # word addresses of the ATmega328P vectors (2 words each)
 TIMER0_OVF_VECTOR = 0x20
 USART_RX_VECTOR = 0x24
@@ -52,6 +59,10 @@ class AVR:
         self.adc = [0] * 8                                    # voltages (0..1023) the outside world puts on ADC0..7
         self.adc_done = 0                                     # cycle at which the running conversion finishes (0 = idle)
         self.input_pins = {"B": 0, "C": 0, "D": 0}            # levels the outside world drives (read via PINx)
+        self.t1_phase = 0
+        self.t1_temp = 0                                      # the shared high-byte register of the 16-bit timer registers
+        self.pwm_log: List[Tuple[float, str, int]] = []       # (ms, "B1", duty 0..255) analogWrite-style duty changes
+        self.pwm_last: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ memory-mapped I/O
     @property
@@ -84,6 +95,11 @@ class AVR:
             return v | 0x20                                   # UDRE0: always ready to send
         if a == UDR0:
             return self.rx.pop(0) if self.rx else 0
+        if a in T1_16BIT:
+            self.t1_temp = self.mem[T1_16BIT[a]]              # reading the low byte latches the high byte
+            return self.mem[a]
+        if a in T1_16BIT.values():
+            return self.t1_temp
         if 0 <= a <= RAM_END:
             return self.mem[a]
         raise EmuError(f"read from unmapped data address 0x{a:04x} at pc=0x{self.pc * 2:04x}")
@@ -101,6 +117,7 @@ class AVR:
             for bit in range(8):
                 if ddr >> bit & 1 and (v ^ old) >> bit & 1:
                     self.pin_log.append((self.ms, f"{port}{bit}", v >> bit & 1))
+            self._pwm_sync()
         elif a in (DDRB, DDRC, DDRD):
             port = {DDRB: "B", DDRC: "C", DDRD: "D"}[a]
             old, out = self.mem[a], self.mem[a + 1]
@@ -108,6 +125,7 @@ class AVR:
             for bit in range(8):                              # a pin starting to drive a 1 goes high now
                 if (v ^ old) >> bit & 1 and out >> bit & 1:
                     self.pin_log.append((self.ms, f"{port}{bit}", v >> bit & 1))
+            self._pwm_sync()
         elif a in (PINB, PINC, PIND):                         # writing PINx toggles PORTx
             self.wr(a + 2, self.mem[a + 2] ^ v)
         elif a == UDR0:
@@ -122,6 +140,21 @@ class AVR:
             self.mem[ADCSRA] = v & ~0x10 & 0xFF
         elif a == ADMUX:
             self.mem[a] = v
+        elif a in T1_16BIT.values():
+            self.t1_temp = v                                  # high byte waits in the temporary register
+        elif a in T1_16BIT:
+            self.mem[a] = v
+            self.mem[T1_16BIT[a]] = self.t1_temp
+            if a == TCNT1L:
+                self.t1_phase = 0
+            self._pwm_sync()
+        elif a in (TCCR1A, TCCR1B, TCCR1C, TCCR2A, TCCR2B, OCR2A, OCR2B, TIMSK1, TIMSK2):
+            self.mem[a] = v
+            self._pwm_sync()
+        elif a == TCNT2:
+            self.mem[a] = v
+        elif a in (TIFR1, TIFR2):
+            self.mem[a] &= ~v & 0xFF
         elif a == TIFR0:
             self.mem[a] &= ~v & 0xFF                          # flags clear by writing a one
         elif a == TCNT0:
@@ -133,6 +166,28 @@ class AVR:
             self.mem[a] = v
         else:
             raise EmuError(f"write to unmapped data address 0x{a:04x} at pc=0x{self.pc * 2:04x}")
+
+    PWM_PINS = {                                              # pin -> (port, bit, OCR address, 16-bit?, TCCRnA address, COM bit mask)
+        "D3": (0xB4, False, TCCR2A, 0x30), "B3": (0xB3, False, TCCR2A, 0xC0),
+        "B1": (OCR1AL, True, TCCR1A, 0xC0), "B2": (OCR1BL, True, TCCR1A, 0x30),
+    }
+
+    def _pwm_sync(self):
+        """Duty of each PWM-capable pin as analogWrite() would describe it: the compare value while the timer drives
+        the pin, otherwise 0 or 255 from the port level."""
+        for key, (ocr, wide, tccr, com) in self.PWM_PINS.items():
+            port, bit = key[0], int(key[1])
+            ddr = self.mem[{"B": DDRB, "C": DDRC, "D": DDRD}[port]] >> bit & 1
+            out = self.mem[{"B": PORTB, "C": PORTC, "D": PORTD}[port]] >> bit & 1
+            if not ddr:
+                continue
+            clk = self.mem[TCCR1B if tccr == TCCR1A else TCCR2B] & 7
+            mode = self.mem[tccr] & 3
+            on = (self.mem[tccr] & com) in (0x80, 0x20) and clk and mode in (1, 3)
+            duty = (self.mem[ocr] if on else (255 if out else 0))
+            if self.pwm_last.get(key) != duty:
+                self.pwm_last[key] = duty
+                self.pwm_log.append((self.ms, key, duty))
 
     def sp(self) -> int:
         return self.mem[SPL] | (self.mem[SPH] << 8)
@@ -206,6 +261,11 @@ class AVR:
         """Word address of the vector to take now (lowest vector number first), or 0."""
         if not self.flag(SREG_I):
             return 0
+        f1, m1 = self.mem[TIFR1], self.mem[TIMSK1]
+        if (f1 & 2) and (m1 & 2):
+            return TIMER1_COMPA_VECTOR
+        if (f1 & 4) and (m1 & 4):
+            return TIMER1_COMPB_VECTOR
         f, m = self.mem[TIFR0], self.mem[TIMSK0]
         if (f & 2) and (m & 2):
             return TIMER0_COMPA_VECTOR
@@ -215,8 +275,31 @@ class AVR:
             return USART_RX_VECTOR
         return 0
 
+    def _timer1(self, n: int):
+        presc = PRESCALE0.get(self.mem[TCCR1B] & 7, 0)
+        if not presc:
+            return
+        mode = ((self.mem[TCCR1B] >> 3) & 3) << 2 | (self.mem[TCCR1A] & 3)
+        if mode not in (0, 4, 5):
+            raise EmuError(f"Timer1 waveform mode {mode} is not emulated")
+        self.t1_phase += n
+        wide = lambda lo: self.mem[lo] | self.mem[lo + 1] << 8
+        while self.t1_phase >= presc:
+            self.t1_phase -= presc
+            t = wide(TCNT1L)
+            top = {0: 0xFFFF, 4: wide(OCR1AL), 5: 0xFF}[mode]
+            t = 0 if t >= top else t + 1
+            if t == wide(OCR1AL) and mode != 5:
+                self.mem[TIFR1] |= 2
+            if t == wide(OCR1BL) and mode != 5:
+                self.mem[TIFR1] |= 4
+            if t == 0 and mode == 0:
+                self.mem[TIFR1] |= 1
+            self.mem[TCNT1L], self.mem[TCNT1H] = t & 255, t >> 8
+
     def advance(self, n: int):
         self.cycles += n
+        self._timer1(n)
         presc = PRESCALE0.get(self.mem[TCCR0B] & 7, 0)
         if presc:
             self.t0_phase += n
@@ -239,7 +322,11 @@ class AVR:
         if vec:
             self.push_pc(self.pc)
             self.setf(SREG_I, 0)
-            if vec == TIMER0_COMPA_VECTOR:
+            if vec == TIMER1_COMPA_VECTOR:
+                self.mem[TIFR1] &= ~2 & 0xFF
+            elif vec == TIMER1_COMPB_VECTOR:
+                self.mem[TIFR1] &= ~4 & 0xFF
+            elif vec == TIMER0_COMPA_VECTOR:
                 self.mem[TIFR0] &= ~2 & 0xFF
             elif vec == TIMER0_OVF_VECTOR:
                 self.mem[TIFR0] &= ~1 & 0xFF

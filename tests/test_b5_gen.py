@@ -155,27 +155,56 @@ def diff(src, events, ms, tol=4):
                 ext.append((t + PHASE, "adc", pinkey(d)[1], int(b)))
     m.run_ms(ms + 1, [(t + PHASE, (l + "\n").encode()) for t, k, l, _ in events if k == "rx"], ext_events=ext)
     # simulator writes -> changes only, per pin
-    exp, last = [], {}
-    for d in ck.node.decls:
-        if getattr(d, 'direction', '') == 'output':
-            last[int(str(d.pin.c))] = 0
-    for _, t, pin, v in s.phys:
-        if last.get(pin) != v:
+    kinds = {int(str(d.pin.c)): d.kind for d in ios.values() if d.direction == "output" and d.kind in ("digital", "pwm", "servo")}
+    exp, last = [], {pin: 0 for pin, k in kinds.items() if k != "servo"}
+    sexp, slast = [], {}
+    for kind, t, pin, v in [e[:4] for e in s.phys if e[0] in ("W", "S")]:
+        if kind == "S":
+            if slast.get(pin) != v:
+                sexp.append((t, pin, v))
+            slast[pin] = v
+        elif last.get(pin) != v:
             exp.append((t, pin, v))
-        last[pin] = v
-    got = []
+            last[pin] = v
+    got, glast = [], {pin: 0 for pin, k in kinds.items() if k != "servo"}
+    def pin_of(port):
+        return {"B": 8, "D": 0, "C": 14}[port[0]] + int(port[1:])
+    raw = [(t, pin_of(port), v, "pin") for t, port, v in m.pin_log] + [(t, pin_of(port), v, "pwm") for t, port, v in m.pwm_log]
+    raw.sort(key=lambda e: e[0])
+    for t, pin, v, src_ in raw:
+        k = kinds.get(pin)
+        if k == "servo" or (k == "pwm") != (src_ == "pwm") or k is None:
+            continue
+        if glast.get(pin) != v:
+            got.append((t, pin, v))
+            glast[pin] = v
+    # servo pulses -> angles
+    sgot, rise, sl = [], {}, {}
     for t, port, v in m.pin_log:
-        pin = {"B": 8, "D": 0, "C": 14}[port[0]] + int(port[1:])
-        got.append((t, pin, v))
-    return ck, s, m, exp, got
+        pin = pin_of(port)
+        if kinds.get(pin) != "servo":
+            continue
+        if v:
+            rise[pin] = t
+        elif pin in rise:
+            us = (t - rise.pop(pin)) * 1000.0
+            ang = int(round((us - 544) * 180 / 1856))
+            if sl.get(pin) != ang:
+                sgot.append((t, pin, ang))
+            sl[pin] = ang
+    return ck, s, m, exp, got, sexp, sgot
 
 
 class Generated(unittest.TestCase):
     def check_match(self, src, events, ms, tol=4):
-        ck, s, m, exp, got = diff(src, events, ms)
+        ck, s, m, exp, got, sexp, sgot = diff(src, events, ms)
         self.assertEqual([x[1:] for x in exp], [x[1:] for x in got], "hardware write order")
         for (t1, *_), (t2, *_) in zip(exp, got):
             self.assertLessEqual(abs(t1 - t2), tol, f"{t1} vs {t2}")
+        # a servo angle is only visible one pulse later: within a frame (20 ms) plus the chosen slot
+        self.assertEqual([x[1:] for x in sexp], [x[1:] for x in sgot], "servo angles")
+        for (t1, *_), (t2, *_) in zip(sexp, sgot):
+            self.assertTrue(0 <= t2 - t1 <= 45, f"servo change at {t1} seen at {t2}")
         self.assertEqual(m.tx_text(), "".join(x + "\r\n" for x in s.tx), "serial text")
         return m
 
@@ -282,6 +311,32 @@ class Generated(unittest.TestCase):
         with self.assertRaises(AvrUnsupported):
             generate_asm(build(src))
 
+    def test_pwm_and_servo(self):
+        src = """node t target uno {
+  output p: pwm(pin 11, safe 0)
+  output q: pwm(pin 3, safe 20, invert)
+  output r: pwm(pin 10, safe 100)
+  output sv: servo(pin 7, safe 90)
+  output sw: servo(pin 4, safe 10)
+  var cnt = 0
+  every 200ms { cnt = cnt + 1  r = cnt * 7 }
+  on SET(a, b) { p = a  sv = b }
+  on Q(a) { q = a  sw = a * 2 }
+  heartbeat off
+}"""
+        ev = [(105, "rx", "SET 50 0", None), (305, "rx", "SET 100 180", None), (505, "rx", "SET 0 45", None),
+              (705, "rx", "Q 33", None), (905, "rx", "Q 150", None), (1105, "rx", "Q -5", None), (1305, "rx", "SET 101 181", None),
+              (1507, "rx", "SET 7 -9", None)]
+        self.check_match(src.replace("output r: pwm(pin 10, safe 100)", "output r: digital(pin 12, safe false)").replace("r = cnt * 7", "r = cnt > 3"), ev, 2200)
+
+    def test_pwm_timer1_and_refusals(self):
+        src = "node t target uno { output a: pwm(pin 9, safe 0)\n output b: pwm(pin 10, safe 100)\n on X(v) { a = v  b = 100 - v }\n heartbeat off }"
+        self.check_match(src, [(105, "rx", "X 30", None), (305, "rx", "X 99", None), (505, "rx", "X 100", None), (705, "rx", "X 0", None)], 1000)
+        for bad, why in (("output a: pwm(pin 5, safe 0)", "pin 5"), ("output a: pwm(pin 9, safe 0)\n output b: servo(pin 7, safe 0)", "Timer1")):
+            with self.assertRaises(AvrUnsupported) as c:
+                generate_asm(build("node t target uno { " + bad + "\n heartbeat off }"))
+            self.assertIn(why, " ".join(c.exception.reasons))
+
     def test_cli_cc(self):
         import subprocess, tempfile
         with tempfile.TemporaryDirectory() as t:
@@ -300,10 +355,10 @@ class Generated(unittest.TestCase):
                          "run: rudrac cc examples/blink_uno.rudra -o examples/avr/blink_rudra --asm")
 
     def test_refuses_unsupported(self):
-        src = "node n target uno { serial 9600\n output l: pwm(pin 9, safe 0)\n heartbeat off }"
+        src = "node n target uno { serial 9600\n output l: tone(pin 8, safe 0)\n heartbeat off }"
         with self.assertRaises(AvrUnsupported) as c:
             generate_asm(build(src))
-        self.assertIn("pwm", c.exception.reasons[0])
+        self.assertIn("tone", c.exception.reasons[0])
 
 
 if __name__ == "__main__":

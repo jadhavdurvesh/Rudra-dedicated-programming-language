@@ -152,7 +152,10 @@ set_led:
         brne set_led_v
         ldi r22, 0
 set_led_v:
-        sts O_led, r22
+        sts O_led+0, r22
+        sts O_led+1, r23
+        sts O_led+2, r24
+        sts O_led+3, r25
         jmp hw_led
 apply_safe:
         ldi r22, 0

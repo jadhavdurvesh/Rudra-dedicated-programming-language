@@ -17,6 +17,11 @@ from .runtime import HELPERS
 
 RAM_START, RAM_END = 0x100, 0x8FF
 RX_RING, RX_MAX = 64, 32
+# PWM-capable pins on timers we can use (pins 5 and 6 sit on Timer0, which runs the 1 ms clock):
+# pin -> (timer, OCR high address or None, OCR low address, TCCRnA address, COM bit mask)
+PWM_PINS = {3: (2, None, 0xB4, 0xB0, 0x20), 11: (2, None, 0xB3, 0xB0, 0x80),
+            9: (1, 0x89, 0x88, 0x80, 0x80), 10: (1, 0x8B, 0x8A, 0x80, 0x20)}
+MAX_SERVOS = 4
 CMP = {"==": ("breq", False), "!=": ("brne", False), "<": ("brlt", False), ">=": ("brge", False),
        ">": ("brlt", True), "<=": ("brge", True)}      # (branch if true, swap operands)
 
@@ -66,8 +71,17 @@ def unsupported(ck: Checked) -> List[str]:
         if d.direction == "input":
             if d.kind not in ("digital", "analog"):
                 why.append(f"input '{d.name}' of kind {d.kind} (only digital and analog inputs are implemented)")
-        elif d.kind != "digital":
-            why.append(f"output '{d.name}' of kind {d.kind} (only digital outputs are implemented)")
+        elif d.kind == "pwm":
+            if _pin(d.pin) not in PWM_PINS:
+                why.append(f"pwm output '{d.name}' on pin {_pin(d.pin)} (only pins 3, 9, 10, 11 can do PWM here: "
+                           "5 and 6 share Timer0 with the 1 ms clock)")
+        elif d.kind not in ("digital", "servo"):
+            why.append(f"output '{d.name}' of kind {d.kind} (only digital, pwm and servo outputs are implemented)")
+    servos = [d for d in ios if d.direction == "output" and d.kind == "servo"]
+    if len(servos) > MAX_SERVOS:
+        why.append(f"{len(servos)} servos (at most {MAX_SERVOS})")
+    if servos and any(d.direction == "output" and d.kind == "pwm" and _pin(d.pin) in (9, 10) for d in ios):
+        why.append("servos together with pwm on pins 9/10 (both need Timer1)")
     if node.address is not None:
         why.append("bus addressing ('address')")
     if node.blackbox_pos is not None:
@@ -123,6 +137,7 @@ class Gen:
         self.slots: Dict[str, str] = {}
         self.ios = {d.name: d for d in self.node.decls if isinstance(d, IO)}
         self.outs = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output"]
+        self.servos = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output" and d.kind == "servo"]
         self.ins = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "input"]
         self.dbs = [d for d in self.ins if d.kind == "digital" and d.cfg.get("debounce")]
         self.vars = [d for d in self.node.decls if isinstance(d, Var)]
@@ -444,6 +459,11 @@ class Gen:
                 self.alloc(f"W_{i}", 1)
                 self.alloc(f"WO_{i}", 1)
                 self.alloc(f"WT_{i}", 4)
+        if self.servos:
+            self.alloc("SVI", 1)
+            self.alloc("SVC", 1)
+            for d in self.servos:
+                self.alloc(f"SVW_{d.name}", 2)
         for d in self.dbs:
             self.alloc(f"DBV_{d.name}", 1)
             self.alloc(f"DBC_{d.name}", 1)
@@ -456,6 +476,11 @@ class Gen:
         w(f"; node: {node.name}   target: {node.target}")
         w(".org 0")
         w("jmp reset")
+        if self.servos:
+            w(".org 0x16")
+            w("jmp isr_t1a")
+            w(".org 0x18")
+            w("jmp isr_t1b")
         w(".org 0x1C")
         w("jmp isr_compa")
         w(".org 0x24")
@@ -480,10 +505,36 @@ class Gen:
         for lab, v in inits:
             self.const(v)
             self.store(lab)
+        pwms = [d for d in self.outs if d.kind == "pwm"]
+        if any(PWM_PINS[_pin(d.pin)][0] == 2 for d in pwms):
+            w("ldi r16, 3")                      # Timer2: fast PWM, clock/64
+            w("sts 0xB0, r16")
+            w("ldi r16, 4")
+            w("sts 0xB1, r16")
+        if any(PWM_PINS[_pin(d.pin)][0] == 1 for d in pwms):
+            w("ldi r16, 1")                      # Timer1: 8-bit fast PWM, clock/64
+            w("sts 0x80, r16")
+            w("ldi r16, 0x0B")
+            w("sts 0x81, r16")
         w("call apply_safe")
         for d in self.outs:
             _, ddr, bit = _port(_pin(d.pin))
             w(f"sbi {ddr}, {bit}")
+        if self.servos:
+            slot = 40000 // len(self.servos) - 1       # 2 MHz timer ticks; the slots together make a 20 ms frame
+            w("ldi r16, 0")
+            w("sts 0x80, r16")
+            w(f"ldi r16, {slot >> 8}")
+            w("sts 0x89, r16")
+            w(f"ldi r16, {slot & 255}")
+            w("sts 0x88, r16")
+            w("ldi r16, 0xFF")                   # compare B must not match before the first pulse is scheduled
+            w("sts 0x8B, r16")
+            w("sts 0x8A, r16")
+            w("ldi r16, 0x06")
+            w("sts 0x6F, r16")
+            w("ldi r16, 0x0A")                   # CTC, clock/8
+            w("sts 0x81, r16")
         for d in self.ins:
             if d.kind == "digital":
                 port, ddr, bit = _port(_pin(d.pin))
@@ -674,42 +725,54 @@ class Gen:
             n = d.name
             port, _, bit = _port(_pin(d.pin))
             hi, lo = ("cbi", "sbi") if d.invert else ("sbi", "cbi")
-            w(f"hw_{n}:")
-            w(f"lds r16, O_{n}")
-            w("tst r16")
-            w(f"breq hw_{n}_lo")
-            w(f"{hi} {port}, {bit}")
-            w("ret")
-            w(f"hw_{n}_lo:")
-            w(f"{lo} {port}, {bit}")
-            w("ret")
-            w(f"set_{n}:")
-            w("mov r16, r22")
-            w("or r16, r23")
-            w("or r16, r24")
-            w("or r16, r25")
-            w("ldi r22, 1")
-            w(f"brne set_{n}_v")
-            w("ldi r22, 0")
-            w(f"set_{n}_v:")
-            if rules:
+            if d.kind == "digital":
+                w(f"hw_{n}:")
                 w(f"lds r16, O_{n}")
-                w("push r16")
-                w(f"sts O_{n}, r22")
+                w("tst r16")
+                w(f"breq hw_{n}_lo")
+                w(f"{hi} {port}, {bit}")
+                w("ret")
+                w(f"hw_{n}_lo:")
+                w(f"{lo} {port}, {bit}")
+                w("ret")
+            elif d.kind == "pwm":
+                self.hw_pwm(d, port, bit)
+            else:
+                self.hw_servo(d)
+            w(f"set_{n}:")
+            if d.kind == "digital":
+                w("mov r16, r22")
+                w("or r16, r23")
+                w("or r16, r24")
+                w("or r16, r25")
+                w("ldi r22, 1")
+                w(f"brne set_{n}_v")
+                w("ldi r22, 0")
+                w(f"set_{n}_v:")
+            else:
+                self.clamp(0, 100 if d.kind == "pwm" else 180)
+            if rules:
+                for k in range(4):
+                    w(f"lds r16, O_{n}+{k}")
+                    w("push r16")
+                self.store(f"O_{n}")
                 w("call rt_rule")
-                w("pop r16")
                 w("tst r22")
                 w(f"breq set_{n}_ok")
-                w(f"sts O_{n}, r16")
+                for k in (3, 2, 1, 0):
+                    w(f"pop r16")
+                    w(f"sts O_{n}+{k}, r16")
                 self.inc_blocked()
                 w("ret")
                 w(f"set_{n}_ok:")
+                for _ in range(4):
+                    w("pop r16")
             else:
-                w(f"sts O_{n}, r22")
+                self.store(f"O_{n}")
             w(f"jmp hw_{n}")
         w("apply_safe:")
         for d in self.outs:
-            self.const(1 if d.cfg["safe"] else 0)
+            self.const(int(d.cfg["safe"]))
             self.store(f"O_{d.name}")
             w(f"call hw_{d.name}")
         w("ret")
@@ -784,6 +847,8 @@ class Gen:
             self.block(self.low.body(e.body, e.params))
             w("ret")
 
+        if self.servos:
+            self.servo_isrs()
         self.owner = "rx"
         self.rx_code()
         self.main_loop()
@@ -884,6 +949,129 @@ class Gen:
             w(f"call h_{i}")
             w(f"{skip}:")
         w("jmp main_loop")
+
+    def clamp(self, lo, hi):
+        """A = min(max(A, lo), hi), signed."""
+        ok1, ok2 = self.lab("Lm"), self.lab("Lm")
+        self.const(lo, 18)
+        self.w("cp r22, r18")
+        for k in (1, 2, 3):
+            self.w(f"cpc r{22 + k}, r{18 + k}")
+        self.w(f"brge {ok1}")
+        self.const(lo)
+        self.w(f"{ok1}:")
+        self.const(hi, 18)
+        self.w("cp r18, r22")
+        for k in (1, 2, 3):
+            self.w(f"cpc r{18 + k}, r{22 + k}")
+        self.w(f"brge {ok2}")
+        self.const(hi)
+        self.w(f"{ok2}:")
+
+    def hw_pwm(self, d, port, bit):
+        n, w = d.name, self.w
+        timer, ocrh, ocrl, tccr, com = PWM_PINS[_pin(d.pin)]
+        w(f"hw_{n}:")
+        self.load(f"O_{n}")
+        self.const(255, 18)
+        w("call mul32")
+        self.const(100, 18)
+        w("call divs32")
+        if d.invert:
+            w("ldi r16, 255")
+            w("eor r22, r16")
+        w("tst r22")
+        w(f"breq hw_{n}_0")
+        w("cpi r22, 255")
+        w(f"breq hw_{n}_f")
+        if ocrh:
+            w(f"sts {ocrh}, r2")
+        w(f"sts {ocrl}, r22")
+        w(f"lds r16, {tccr}")
+        w(f"ori r16, {com}")
+        w(f"sts {tccr}, r16")
+        w("ret")
+        for lab, op in (("0", "cbi"), ("f", "sbi")):
+            w(f"hw_{n}_{lab}:")
+            w(f"{op} {port}, {bit}")
+            w(f"lds r16, {tccr}")
+            w(f"andi r16, {(~com) & 0xFF}")
+            w(f"sts {tccr}, r16")
+            w("ret")
+
+    def hw_servo(self, d):
+        n, w = d.name, self.w
+        w(f"hw_{n}:")
+        self.load(f"O_{n}")
+        self.const(1856, 18)
+        w("call mul32")
+        self.const(180, 18)
+        w("call divs32")
+        self.const(544, 18)
+        w("call add32")
+        w("lsl r22")                      # microseconds -> 0.5 us timer ticks
+        w("rol r23")
+        w("in r16, 0x3f")
+        w("cli")
+        w(f"sts SVW_{n}, r22")
+        w(f"sts SVW_{n}+1, r23")
+        w("out 0x3f, r16")
+        w("ret")
+
+    def servo_isrs(self):
+        w, sv = self.w, self.servos
+        w("isr_t1a:                      ; start of a servo slot: raise this servo's pin, schedule its end")
+        for r in ("r16", "r17", "r30"):
+            w(f"push {r}")
+        w("in r16, 0x3f")
+        w("push r16")
+        w("lds r16, SVI")
+        w("sts SVC, r16")
+        done = self.lab("Lv")
+        for k, d in enumerate(sv):
+            nx = self.lab("Lv")
+            port, _, bit = _port(_pin(d.pin))
+            w(f"cpi r16, {k}")
+            w(f"brne {nx}")
+            w(f"sbi {port}, {bit}")
+            w(f"lds r17, SVW_{d.name}+1")
+            w(f"lds r30, SVW_{d.name}")
+            w("sts 0x8B, r17")
+            w("sts 0x8A, r30")
+            w(f"rjmp {done}")
+            w(f"{nx}:")
+        w(f"{done}:")
+        w("lds r16, SVI")
+        w("inc r16")
+        w(f"cpi r16, {len(sv)}")
+        w("brlo isr_t1a_s")
+        w("clr r16")
+        w("isr_t1a_s:")
+        w("sts SVI, r16")
+        w("pop r16")
+        w("out 0x3f, r16")
+        for r in ("r30", "r17", "r16"):
+            w(f"pop {r}")
+        w("reti")
+        w("isr_t1b:                      ; end of the pulse: lower the pin")
+        w("push r16")
+        w("in r16, 0x3f")
+        w("push r16")
+        w("lds r16, SVC")
+        done = self.lab("Lv")
+        for k, d in enumerate(sv):
+            nx = self.lab("Lv")
+            port, _, bit = _port(_pin(d.pin))
+            w(f"cpi r16, {k}")
+            w(f"brne {nx}")
+            w(f"cbi {port}, {bit}")
+            w(f"rjmp {done}")
+            w(f"{nx}:")
+        w(f"{done}:")
+        w("pop r16")
+        w("out 0x3f, r16")
+        w("pop r16")
+        w("reti")
 
     def when(self, i, e):
         w = self.w
