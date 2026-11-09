@@ -21,14 +21,32 @@ class ExtraMixin:
                 self.load("NOWC")
                 self.load(f"TS_{n}", 18)
                 w("call sub32")
-                self.cmp_ge(iv, skip)
-                self.cmp_ge(2 * iv, plus)
+                if n in self.step_paths:
+                    self.load(f"IV_{n}", 18)
+                    w("cp r22, r18")
+                    for k in (1, 2, 3):
+                        w(f"cpc r{22 + k}, r{18 + k}")
+                    self.br_far("brlo", skip)
+                    w("add r18, r18")                  # 2 * interval
+                    w("adc r19, r19")
+                    w("adc r20, r20")
+                    w("adc r21, r21")
+                    w("cp r22, r18")
+                    for k in (1, 2, 3):
+                        w(f"cpc r{22 + k}, r{18 + k}")
+                    self.br_far("brlo", plus)
+                else:
+                    self.cmp_ge(iv, skip)
+                    self.cmp_ge(2 * iv, plus)
                 self.load("NOWC")
                 self.store(f"TS_{n}")
                 w(f"rjmp {go}")
                 w(f"{plus}:")
                 self.load(f"TS_{n}")
-                self.const(iv, 18)
+                if n in self.step_paths:
+                    self.load(f"IV_{n}", 18)
+                else:
+                    self.const(iv, 18)
                 w("call add32")
                 self.store(f"TS_{n}")
                 w(f"{go}:")
@@ -299,4 +317,171 @@ class ExtraMixin:
         w("andi r25, 0x7F")
         w("call tx_i32")
         w("call tx_crlf")
+        w("ret")
+
+    # ------------------------------------------------------------------ paths (stage B5.5c)
+    def path_routines(self):
+        w = self.w
+        outs = {}
+        for p in self.paths:
+            outs.setdefault(p.out, []).append(p)
+        decl = {d.name: d for d in self.outs}
+        # pe_<P>: enter the waypoint PIDX of P
+        for p in self.paths:
+            n, d = p.name, decl[p.out]
+            w(f"pe_{n}:")
+            w(f"lds r16, PIDX_{n}")
+            for k, pt in enumerate(p.points):
+                nx = self.lab("Lp")
+                w(f"cpi r16, {k}")
+                w(f"breq {nx}_y")
+                w(f"rjmp {nx}")
+                w(f"{nx}_y:")
+                if p.kind == "stepper":
+                    iv = d.cfg["interval"] if pt.sp is None else max(1, 1000 // pt.sp)
+                    self.const(iv)
+                    self.store(f"IV_{p.out}")
+                    self.const(pt.v)
+                    w(f"call set_{p.out}")
+                    w("ldi r16, 1")
+                    w(f"sts PST_{n}, r16")
+                else:
+                    self.const(pt.v)
+                    w(f"call set_{p.out}")
+                    w("ldi r16, 2")
+                    w(f"sts PST_{n}, r16")
+                    self.load("NOWC")
+                    self.store(f"PT_{n}")
+                w("ret")
+                w(f"{nx}:")
+            w("ret")
+        # pn_<P>: next waypoint, repeat, or finish
+        for p in self.paths:
+            n, d = p.name, decl[p.out]
+            again, fin = self.lab("Lp"), self.lab("Lp")
+            w(f"pn_{n}:")
+            w(f"lds r16, PIDX_{n}")
+            w("inc r16")
+            w(f"sts PIDX_{n}, r16")
+            w(f"cpi r16, {len(p.points)}")
+            w(f"brsh {again}")
+            w(f"jmp pe_{n}")
+            w(f"{again}:")
+            if p.forever:
+                w(f"sts PIDX_{n}, r2")
+                w(f"jmp pe_{n}")
+            else:
+                self.load(f"PREP_{n}")
+                self.const(1, 18)
+                w("cp r18, r22")                       # 1 < prep ?
+                for j in (1, 2, 3):
+                    w(f"cpc r{18 + j}, r{22 + j}")
+                w(f"brlt {fin}x")
+                w(f"rjmp {fin}")
+                w(f"{fin}x:")
+                self.const(1, 18)
+                self.load(f"PREP_{n}")
+                w("call sub32")
+                self.store(f"PREP_{n}")
+                w(f"sts PIDX_{n}, r2")
+                w(f"jmp pe_{n}")
+                w(f"{fin}:")
+            if not p.forever:
+                pass
+            w(f"sts PST_{n}, r2")
+            if p.kind == "stepper":
+                self.const(d.cfg["interval"])
+                self.store(f"IV_{p.out}")
+            if n in self.dones:
+                w(f"jmp h_{self.dones[n]}")
+            else:
+                w("ret")
+        # pcancel_<out>, prun_<P>, pstop_<out>
+        for out, ps in outs.items():
+            d = decl[out]
+            w(f"pcancel_{out}:")
+            for p in ps:
+                w(f"sts PST_{p.name}, r2")
+            if out in self.step_paths:
+                self.const(d.cfg["interval"])
+                self.store(f"IV_{out}")
+            w("ret")
+            w(f"pstop_{out}:")
+            w(f"call pcancel_{out}")
+            if d.kind == "stepper":
+                self.load(f"SP_{out}")
+                self.store(f"O_{out}")
+                w("ret")
+            else:
+                self.const(int(d.cfg["safe"]))
+                w(f"jmp set_{out}")
+        for p in self.paths:
+            n = p.name
+            w(f"prun_{n}:")
+            w(f"call pcancel_{p.out}")
+            w(f"sts PIDX_{n}, r2")
+            self.const(p.repeat)
+            self.store(f"PREP_{n}")
+            w(f"jmp pe_{n}")
+        # r_paths: advance every active path (called once per loop pass, after the event handlers)
+        w("r_paths:")
+        for p in self.paths:
+            n = p.name
+            skip, st2 = self.lab("Lq"), self.lab("Lq")
+            w(f"lds r16, PST_{n}")
+            w("tst r16")
+            w(f"brne {n}_act")
+            w(f"rjmp {skip}")
+            w(f"{n}_act:")
+            if p.kind == "stepper":
+                w("cpi r16, 1")
+                self.br_far("brne", st2)
+                for k, pt in enumerate(p.points):
+                    nx = self.lab("Lq")
+                    w(f"lds r16, PIDX_{n}")
+                    w(f"cpi r16, {k}")
+                    w(f"breq {nx}_y")
+                    w(f"rjmp {nx}")
+                    w(f"{nx}_y:")
+                    self.load(f"SP_{p.out}")
+                    self.const(pt.v, 18)
+                    w("call sub32")
+                    w("sbrs r25, 7")
+                    w(f"rjmp {nx}_p")
+                    w("call neg32")
+                    w(f"{nx}_p:")
+                    self.const(pt.zn, 18)
+                    w("cp r18, r22")                   # zone < |diff| ?  then not there yet
+                    for j in (1, 2, 3):
+                        w(f"cpc r{18 + j}, r{22 + j}")
+                    w(f"brge {nx}_in")
+                    w(f"rjmp {skip}")
+                    w(f"{nx}_in:")
+                    if pt.wt > 0:
+                        w("ldi r16, 2")
+                        w(f"sts PST_{n}, r16")
+                        self.load("NOWC")
+                        self.store(f"PT_{n}")
+                        w(f"rjmp {skip}")
+                    else:
+                        w(f"call pn_{n}")
+                        w(f"rjmp {skip}")
+                    w(f"{nx}:")
+                w(f"rjmp {skip}")
+            w(f"{st2}:")
+            for k, pt in enumerate(p.points):
+                nx = self.lab("Lq")
+                w(f"lds r16, PIDX_{n}")
+                w(f"cpi r16, {k}")
+                w(f"breq {nx}_y")
+                w(f"rjmp {nx}")
+                w(f"{nx}_y:")
+                self.load("NOWC")
+                self.load(f"PT_{n}", 18)
+                w("call sub32")
+                self.cmp_ge(pt.wt, f"{skip}")
+                w(f"call pn_{n}")
+                w(f"rjmp {skip}")
+                w(f"{nx}:")
+            w(f"{skip}:")
         w("ret")

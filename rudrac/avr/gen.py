@@ -77,17 +77,14 @@ def unsupported(ck: Checked) -> List[str]:
         why.append("servos together with pwm on pins 9/10 (both need Timer1)")
     if node.address is not None:
         why.append("bus addressing ('address')")
-    if node.paths:
-        why.append("paths")
     for e in node.events:
-        if e.kind not in ("every", "on", "heartbeat", "start", "when", "enter", "exit"):
+        if e.kind not in ("every", "on", "heartbeat", "start", "when", "enter", "exit", "done"):
             why.append(f"'{e.kind}' handlers")
     low = I.Lowerer(ck)
-    bad_stmt = (I.FillS, I.PixelS, I.AnimS, I.RunS, I.StopS, I.CancelS)
+    bad_stmt = (I.FillS, I.PixelS, I.AnimS)
 
     def ex(e):
-        if isinstance(e, I.Running):
-            why.append("path names as values")
+        pass
         for f in ("e", "l", "r", "idx"):
             v = getattr(e, f, None)
             if v is not None and not isinstance(v, (int, str, bool)):
@@ -99,7 +96,7 @@ def unsupported(ck: Checked) -> List[str]:
         if isinstance(s, bad_stmt):
             why.append(type(s).__name__.replace("S", "", 1).lower() + " statements")
 
-    bodies = [low.body(e.body, e.params) for e in node.events if e.kind in ("every", "on", "heartbeat", "start", "when", "enter", "exit")]
+    bodies = [low.body(e.body, e.params) for e in node.events if e.kind in ("every", "on", "heartbeat", "start", "when", "enter", "exit", "done")]
     for e in node.events:
         if e.kind == "when":
             ex(low.expr(e.arg))
@@ -136,6 +133,9 @@ class Gen(ExtraMixin):
         self.steppers = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output" and d.kind == "stepper"]
         self.bb_on = self.node.blackbox_pos is not None
         self.bb_n = self.node.blackbox if self.bb_on else 0
+        self.paths = list(self.node.paths)
+        self.step_paths = {p.out for p in self.paths if p.kind == "stepper"}
+        self.dones = {e.name: i for i, e in enumerate(self.node.events) if e.kind == "done"}
         self.need_mstep = any(d.cfg.get("ramp") or d.cfg.get("timeout") for d in self.motors)
         self.pwm_pins = {}                                  # pin -> True, for every pin driven with analogWrite semantics
         for d in self.outs:
@@ -233,6 +233,16 @@ class Gen(ExtraMixin):
             self.w("call not32")
         elif isinstance(e, I.Op):
             self.op(e)
+        elif isinstance(e, I.Running):
+            on = self.lab("Lr")
+            self.w(f"lds r16, PST_{e.name}")
+            self.w("ldi r22, 0")
+            self.w("tst r16")
+            self.w(f"breq {on}")
+            self.w("ldi r22, 1")
+            self.w(f"{on}:")
+            for r in (23, 24, 25):
+                self.w(f"ldi r{r}, 0")
         elif isinstance(e, I.In):
             self.w(f"call i_{e.name}")
         elif isinstance(e, I.CallE):
@@ -383,6 +393,12 @@ class Gen(ExtraMixin):
             if s.e is not None:
                 self.ex(s.e)
             self.w("ret")
+        elif isinstance(s, I.RunS):
+            self.w(f"call prun_{s.name}")
+        elif isinstance(s, I.StopS):
+            self.w(f"call pstop_{s.out}")
+        elif isinstance(s, I.CancelS):
+            self.w(f"call pcancel_{s.out}")
         elif isinstance(s, I.GotoS):
             self.w(f"ldi r16, {s.index}")
             self.w("call r_goto")
@@ -478,6 +494,13 @@ class Gen(ExtraMixin):
         for d in self.steppers:
             self.alloc(f"SP_{d.name}", 4)
             self.alloc(f"TS_{d.name}", 4)
+            if d.name in self.step_paths:
+                self.alloc(f"IV_{d.name}", 4)
+        for p in self.paths:
+            self.alloc(f"PST_{p.name}", 1)
+            self.alloc(f"PIDX_{p.name}", 1)
+            self.alloc(f"PREP_{p.name}", 4)
+            self.alloc(f"PT_{p.name}", 4)
         if self.need_mstep:
             self.alloc("TMOT", 4)
         if self.bb_on:
@@ -545,7 +568,7 @@ class Gen(ExtraMixin):
             w("sts 0x80, r16")
             w("ldi r16, 0x0B")
             w("sts 0x81, r16")
-        w("call apply_safe")
+        w("call apply_safe")                    # also loads each path-driven stepper's declared interval
         for pin in self.all_out_pins():
             _, ddr, bit = _port(pin)
             w(f"sbi {ddr}, {bit}")
@@ -825,6 +848,12 @@ class Gen(ExtraMixin):
                 w(f"jmp hw_{n}")
         self.pwm_write_routines()
         w("apply_safe:")
+        for p in self.paths:
+            w(f"sts PST_{p.name}, r2")
+        for d in self.steppers:
+            if d.name in self.step_paths:
+                self.const(d.cfg["interval"])
+                self.store(f"IV_{d.name}")
         for d in self.outs:
             self.const(int(d.cfg["safe"]))
             self.store(f"O_{d.name}")
@@ -841,6 +870,8 @@ class Gen(ExtraMixin):
         w("ret")
 
         self.stepper_motor_routines()
+        if self.paths:
+            self.path_routines()
         if self.bb_on:
             self.bb_routines()
         if ck.states:
@@ -906,7 +937,7 @@ class Gen(ExtraMixin):
             self.block(self.low.fn_body(f.name))
             w("ret")
         for i, e in self.events:
-            if e.kind not in ("every", "on", "heartbeat", "start", "when", "enter", "exit"):
+            if e.kind not in ("every", "on", "heartbeat", "start", "when", "enter", "exit", "done"):
                 continue
             self.owner = f"h{i}"
             w(f"h_{i}:   ; {e.kind} {e.name or ''}")
@@ -1019,6 +1050,8 @@ class Gen(ExtraMixin):
             w(f"{run}:")
             w(f"call h_{i}")
             w(f"{skip}:")
+        if self.paths:
+            w("call r_paths")
         if self.need_mstep:
             skip, plus, run = self.lab("Lt"), self.lab("Lt"), self.lab("Lt")
             self.load("NOWC")
