@@ -9,7 +9,7 @@ jobs:
   core:
     name: core suite (${{ matrix.engine }} engine, py${{ matrix.python }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +32,7 @@ jobs:
   avr-emulator:
     name: AVR backend vs simulator (emulator)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

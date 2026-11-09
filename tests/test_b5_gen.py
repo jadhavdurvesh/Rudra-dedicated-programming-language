@@ -155,7 +155,15 @@ def diff(src, events, ms, tol=4):
                 ext.append((t + PHASE, "adc", pinkey(d)[1], int(b)))
     m.run_ms(ms + 1, [(t + PHASE, (l + "\n").encode()) for t, k, l, _ in events if k == "rx"], ext_events=ext)
     # simulator writes -> changes only, per pin
-    kinds = {int(str(d.pin.c)): d.kind for d in ios.values() if d.direction == "output" and d.kind in ("digital", "pwm", "servo")}
+    kinds = {}
+    for d in ios.values():
+        if d.direction != "output":
+            continue
+        if d.kind in ("motor", "stepper"):
+            for role, pin in d.cfg["pins"].items():
+                kinds[int(str(pin.c))] = "pwm" if role in ("pwm", "fwd", "rev") else "digital"
+        elif d.kind in ("digital", "pwm", "servo"):
+            kinds[int(str(d.pin.c))] = d.kind
     exp, last = [], {pin: 0 for pin, k in kinds.items() if k != "servo"}
     sexp, slast = [], {}
     for kind, t, pin, v in [e[:4] for e in s.phys if e[0] in ("W", "S")]:
@@ -328,6 +336,51 @@ class Generated(unittest.TestCase):
               (705, "rx", "Q 33", None), (905, "rx", "Q 150", None), (1105, "rx", "Q -5", None), (1305, "rx", "SET 101 181", None),
               (1507, "rx", "SET 7 -9", None)]
         self.check_match(src.replace("output r: pwm(pin 10, safe 100)", "output r: digital(pin 12, safe false)").replace("r = cnt * 7", "r = cnt > 3"), ev, 2200)
+
+    def test_motors_ramp_timeout_blackbox(self):
+        src = """node t target uno {
+  output a: motor(pwm 11, dir 4, ramp 400, timeout 600, limit 80, safe 0)
+  output b: motor(fwd 9, rev 3, safe 0)
+  output led: digital(pin 13, safe false)
+  never a > 60 && led
+  blackbox 6
+  on A(v) { a = v }
+  on B(v) { b = v }
+  on L(v) { led = v > 0 }
+  heartbeat off
+}"""
+        ev = [(105, "rx", "A 50", None), (205, "rx", "B -30", None), (405, "rx", "A -90", None), (905, "rx", "B 100", None),
+              (1105, "rx", "L 1", None), (1205, "rx", "A 70", None), (1405, "rx", "L 0", None), (1505, "rx", "A 70", None),
+              (1805, "rx", "A 95", None), (2005, "rx", "B -150", None), (2605, "rx", "LOG", None), (2705, "rx", "STATUS", None)]
+        m = self.check_match(src, ev, 3300)
+        self.assertIn("LOGEND", m.tx_text())
+
+    def test_stepper(self):
+        src = """node t target uno {
+  output s: stepper(step 8, dir 12, rate 200, safe 0)
+  output t: stepper(step 6, dir 7, rate 50, safe 5)
+  on GO(p) { s = p }
+  on GT(p) { t = p }
+  heartbeat 400ms { s = 0 }
+}"""
+        ev = [(107, "rx", "GO 12", None), (307, "rx", "GT 4", None), (359, "rx", "PING", None), (507, "rx", "GO -3", None),
+              (707, "rx", "PING", None), (1102, "rx", "GO 6", None)]
+        self.check_match(src, ev, 2500)
+
+    def test_blackbox_events(self):
+        src = """node t target uno {
+  output led: digital(pin 13, safe false)
+  var arr: int[3]
+  state a { enter { led = true } on GO { goto b } }
+  state b { enter { led = false } on GO { goto a } }
+  blackbox 4
+  on W(i) { arr[i] = 1 }
+  heartbeat 300ms { led = false }
+}"""
+        ev = [(105, "rx", "GO", None), (155, "rx", "W 7", None), (205, "rx", "GO", None), (255, "rx", "W -1", None),
+              (305, "rx", "GO", None), (355, "rx", "LOG", None), (400, "rx", "PING", None), (1000, "rx", "LOG", None)]
+        m = self.check_match(src, ev, 1500)
+        self.assertIn("LOG ", m.tx_text())
 
     def test_pwm_timer1_and_refusals(self):
         src = "node t target uno { output a: pwm(pin 9, safe 0)\n output b: pwm(pin 10, safe 100)\n on X(v) { a = v  b = 100 - v }\n heartbeat off }"

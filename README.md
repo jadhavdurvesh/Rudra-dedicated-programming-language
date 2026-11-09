@@ -458,7 +458,7 @@ The generated master-side C++ header is compiled and run, and the generated Pyth
     rudrac cc examples/blink_uno.rudra --asm      # writes blink_uno.hex (+ .S); no avr-gcc, no Arduino IDE
     rudrac upload blink_uno.hex COM3               # or XLoader / avrdude
 
-The backend handles Uno/Nano programs that use digital, pwm (pins 3, 9, 10, 11) and servo (up to 4) outputs, digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
+The backend handles Uno/Nano programs that use digital, pwm (pins 3, 9, 10, 11), servo (up to 4), motor, and stepper outputs, black box (LOG), digital inputs (pullup, invert, debounce), analog inputs, `when` / `when ... for`, states (`enter`/`exit`/`goto`), `every`, `start`, `on` (with integer arguments),
 `heartbeat`, `never`, `func`/`proc`, `var`/`let`, arrays, structs, enums, `if`, `for`, `break`, `send` and the
 built-in PING/WHO/STATUS. Anything else (i2c/ultrasonic inputs, pwm on pins 5/6 (Timer0 runs the clock), motor/stepper/neopixel/tone, paths,
 blackbox, bus) is refused with the list of reasons; use `rudrac build` for those. It is never compiled differently.
@@ -479,3 +479,8 @@ PWM and servo (v0.17): PWM runs at about 976 Hz (fast PWM, clock/64) and, like A
 is a plain digital write. Servo pulses come from Timer1 in slots (each servo gets its own slot of a 20 ms frame); angle
 to pulse width follows the Servo library (544..2400 us). In the tests a servo angle is read back from the measured pulse
 width on the emulated pin and compared with the simulator's angle sequence.
+
+Motors and steppers (v0.18): a motor's PWM pins must be 3, 9, 10 or 11. Ramp and timeout run every 20 ms exactly as in the
+simulator; steppers step on their own interval with a pulse of about 1 us, and keep stepping while the heartbeat has
+tripped (towards the safe position). The black box is a RAM ring buffer (9 bytes per entry, up to 64 entries), read
+back with LOG, like the simulator. Paths are still refused.

@@ -26,26 +26,10 @@ CMP = {"==": ("breq", False), "!=": ("brne", False), "<": ("brlt", False), ">=":
        ">": ("brlt", True), "<=": ("brge", True)}      # (branch if true, swap operands)
 
 
-class AvrUnsupported(Exception):
-    def __init__(self, reasons):
-        self.reasons = list(reasons)
-        super().__init__("; ".join(self.reasons))
+from .gen_util import _pin, _port  # noqa: E402,F401
 
 
-def _pin(pin) -> int:
-    c = str(pin.c)
-    return 14 + int(c[1:]) if c[0] in "Aa" else int(c)
-
-
-def _port(n: int) -> Tuple[int, int, int]:
-    """(PORT io address, DDR io address, bit) of an Uno digital pin number."""
-    if n <= 7:
-        return 0x0B, 0x0A, n
-    if n <= 13:
-        return 0x05, 0x04, n - 8
-    if n <= 19:
-        return 0x08, 0x07, n - 14
-    raise AvrUnsupported([f"pin {n} does not exist on this chip"])
+from .gen_util import AvrUnsupported  # noqa: E402,F401
 
 
 def _walk(stmts, expr_fn, stmt_fn):
@@ -75,17 +59,24 @@ def unsupported(ck: Checked) -> List[str]:
             if _pin(d.pin) not in PWM_PINS:
                 why.append(f"pwm output '{d.name}' on pin {_pin(d.pin)} (only pins 3, 9, 10, 11 can do PWM here: "
                            "5 and 6 share Timer0 with the 1 ms clock)")
+        elif d.kind in ("motor", "stepper"):
+            for role, pin in d.cfg["pins"].items():
+                if role in ("pwm", "fwd", "rev") and _pin(pin) not in PWM_PINS:
+                    why.append(f"motor '{d.name}': the {role} pin {_pin(pin)} must be 3, 9, 10 or 11 (PWM on Timer1/Timer2)")
+                elif _pin(pin) > 19:
+                    why.append(f"pin {_pin(pin)} does not exist on this chip")
         elif d.kind not in ("digital", "servo"):
-            why.append(f"output '{d.name}' of kind {d.kind} (only digital, pwm and servo outputs are implemented)")
+            why.append(f"output '{d.name}' of kind {d.kind} (only digital, pwm, servo, motor and stepper outputs are implemented)")
     servos = [d for d in ios if d.direction == "output" and d.kind == "servo"]
     if len(servos) > MAX_SERVOS:
         why.append(f"{len(servos)} servos (at most {MAX_SERVOS})")
-    if servos and any(d.direction == "output" and d.kind == "pwm" and _pin(d.pin) in (9, 10) for d in ios):
+    t1 = [d for d in ios if d.direction == "output" and (
+        (d.kind == "pwm" and _pin(d.pin) in (9, 10)) or
+        (d.kind == "motor" and any(_pin(p) in (9, 10) for r, p in d.cfg["pins"].items() if r in ("pwm", "fwd", "rev"))))]
+    if servos and t1:
         why.append("servos together with pwm on pins 9/10 (both need Timer1)")
     if node.address is not None:
         why.append("bus addressing ('address')")
-    if node.blackbox_pos is not None:
-        why.append("blackbox")
     if node.paths:
         why.append("paths")
     for e in node.events:
@@ -120,7 +111,10 @@ def unsupported(ck: Checked) -> List[str]:
     return sorted(set(why))
 
 
-class Gen:
+from .extra import ExtraMixin  # noqa: E402
+
+
+class Gen(ExtraMixin):
     def __init__(self, ck: Checked):
         reasons = unsupported(ck)
         if reasons:
@@ -138,6 +132,19 @@ class Gen:
         self.ios = {d.name: d for d in self.node.decls if isinstance(d, IO)}
         self.outs = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output"]
         self.servos = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output" and d.kind == "servo"]
+        self.motors = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output" and d.kind == "motor"]
+        self.steppers = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "output" and d.kind == "stepper"]
+        self.bb_on = self.node.blackbox_pos is not None
+        self.bb_n = self.node.blackbox if self.bb_on else 0
+        self.need_mstep = any(d.cfg.get("ramp") or d.cfg.get("timeout") for d in self.motors)
+        self.pwm_pins = {}                                  # pin -> True, for every pin driven with analogWrite semantics
+        for d in self.outs:
+            if d.kind == "pwm":
+                self.pwm_pins[_pin(d.pin)] = True
+            elif d.kind == "motor":
+                for r, p in d.cfg["pins"].items():
+                    if r in ("pwm", "fwd", "rev"):
+                        self.pwm_pins[_pin(p)] = True
         self.ins = [d for d in self.node.decls if isinstance(d, IO) and d.direction == "input"]
         self.dbs = [d for d in self.ins if d.kind == "digital" and d.cfg.get("debounce")]
         self.vars = [d for d in self.node.decls if isinstance(d, Var)]
@@ -289,7 +296,8 @@ class Gen:
     def elem_addr(self, slot: str, size: int, proven: bool, oob: str):
         """Index in r18:r21 (B); leaves Z = &slot[index]; jumps to oob when the index is out of range."""
         if not proven:
-            self.w("or r20, r21")
+            self.w("mov r16, r20")
+            self.w("or r16, r21")
             self.br_far("brne", oob)
             self.w(f"cpi r18, {size & 0xFF}")
             self.w(f"ldi r16, {size >> 8}")
@@ -362,6 +370,11 @@ class Gen:
             self.w(f"jmp {end}")
             self.w(f"{oob}:")
             self.inc_blocked()
+            if self.bb_on:
+                self.w("movw r22, r18")
+                self.w("movw r24, r20")
+                self.w("ldi r16, 6")
+                self.w("call bb_log")
             self.w(f"{end}:")
         elif isinstance(s, I.SetO):
             self.ex(s.e)
@@ -459,6 +472,23 @@ class Gen:
                 self.alloc(f"W_{i}", 1)
                 self.alloc(f"WO_{i}", 1)
                 self.alloc(f"WT_{i}", 4)
+        for d in self.motors:
+            self.alloc(f"CUR_{d.name}", 4)
+            self.alloc(f"ML_{d.name}", 4)
+        for d in self.steppers:
+            self.alloc(f"SP_{d.name}", 4)
+            self.alloc(f"TS_{d.name}", 4)
+        if self.need_mstep:
+            self.alloc("TMOT", 4)
+        if self.bb_on:
+            self.alloc("BBH", 1)
+            self.alloc("BBN", 1)
+            self.alloc("BBI", 1)
+            self.alloc("BBK", 1)
+            self.alloc("BBTOT", 4)
+            self.alloc("BBT", 4 * self.bb_n)
+            self.alloc("BBA", 4 * self.bb_n)
+            self.alloc("BBC", self.bb_n)
         if self.servos:
             self.alloc("SVI", 1)
             self.alloc("SVC", 1)
@@ -505,20 +535,19 @@ class Gen:
         for lab, v in inits:
             self.const(v)
             self.store(lab)
-        pwms = [d for d in self.outs if d.kind == "pwm"]
-        if any(PWM_PINS[_pin(d.pin)][0] == 2 for d in pwms):
+        if any(PWM_PINS[p][0] == 2 for p in self.pwm_pins):
             w("ldi r16, 3")                      # Timer2: fast PWM, clock/64
             w("sts 0xB0, r16")
             w("ldi r16, 4")
             w("sts 0xB1, r16")
-        if any(PWM_PINS[_pin(d.pin)][0] == 1 for d in pwms):
+        if any(PWM_PINS[p][0] == 1 for p in self.pwm_pins):
             w("ldi r16, 1")                      # Timer1: 8-bit fast PWM, clock/64
             w("sts 0x80, r16")
             w("ldi r16, 0x0B")
             w("sts 0x81, r16")
         w("call apply_safe")
-        for d in self.outs:
-            _, ddr, bit = _port(_pin(d.pin))
+        for pin in self.all_out_pins():
+            _, ddr, bit = _port(pin)
             w(f"sbi {ddr}, {bit}")
         if self.servos:
             slot = 40000 // len(self.servos) - 1       # 2 MHz timer ticks; the slots together make a 20 ms frame
@@ -573,6 +602,7 @@ class Gen:
         w("ldi r16, 2")
         w("sts 0x6E, r16")
         w("sei")
+        self.bb(1, 0)
         for i, e in self.events:
             if e.kind == "start":
                 w(f"call h_{i}")
@@ -723,7 +753,10 @@ class Gen:
                 w("ret")
         for d in self.outs:
             n = d.name
-            port, _, bit = _port(_pin(d.pin))
+            if d.kind in ("motor", "stepper"):
+                port = bit = 0
+            else:
+                port, _, bit = _port(_pin(d.pin))
             hi, lo = ("cbi", "sbi") if d.invert else ("sbi", "cbi")
             if d.kind == "digital":
                 w(f"hw_{n}:")
@@ -737,7 +770,9 @@ class Gen:
                 w("ret")
             elif d.kind == "pwm":
                 self.hw_pwm(d, port, bit)
-            else:
+            elif d.kind == "motor":
+                self.hw_motor(d)
+            elif d.kind == "servo":
                 self.hw_servo(d)
             w(f"set_{n}:")
             if d.kind == "digital":
@@ -749,6 +784,14 @@ class Gen:
                 w(f"brne set_{n}_v")
                 w("ldi r22, 0")
                 w(f"set_{n}_v:")
+            elif d.kind == "stepper":
+                pass
+            elif d.kind == "motor":
+                lim = d.cfg["limit"]
+                self.clamp(-lim, lim)
+                self.load("NOWC", 18)
+                for k in range(4):
+                    w(f"sts ML_{n}+{k}, r{18 + k}")
             else:
                 self.clamp(0, 100 if d.kind == "pwm" else 180)
             if rules:
@@ -763,18 +806,32 @@ class Gen:
                     w(f"pop r16")
                     w(f"sts O_{n}+{k}, r16")
                 self.inc_blocked()
+                w("clr r23")
+                w("clr r24")
+                w("clr r25")
+                self.bb_A(4)
                 w("ret")
                 w(f"set_{n}_ok:")
                 for _ in range(4):
                     w("pop r16")
             else:
                 self.store(f"O_{n}")
-            w(f"jmp hw_{n}")
+            if d.kind == "stepper":
+                w("ret")
+            else:
+                if d.kind == "motor" and not d.cfg.get("ramp"):
+                    self.load(f"O_{n}")
+                    self.store(f"CUR_{n}")
+                w(f"jmp hw_{n}")
+        self.pwm_write_routines()
         w("apply_safe:")
         for d in self.outs:
             self.const(int(d.cfg["safe"]))
             self.store(f"O_{d.name}")
-            w(f"call hw_{d.name}")
+            if d.kind == "motor":
+                self.store(f"CUR_{d.name}")
+            if d.kind != "stepper":
+                w(f"call hw_{d.name}")
         w("ret")
         w("rt_heard:")
         if self.hb:
@@ -783,6 +840,9 @@ class Gen:
             w("sts HBTRIP, r2")
         w("ret")
 
+        self.stepper_motor_routines()
+        if self.bb_on:
+            self.bb_routines()
         if ck.states:
             w("r_goto:                       ; r16 = new state index")
             w("lds r17, ST")
@@ -819,6 +879,14 @@ class Gen:
                 w(f"{sk}:")
                 w("pop r16")
                 w("push r16")
+            if self.bb_on:
+                w("pop r22")
+                w("push r22")
+                w("clr r23")
+                w("clr r24")
+                w("clr r25")
+                w("ldi r16, 3")
+                w("call bb_log")
             for i, e in self.events:
                 if e.kind == "enter":
                     sk = self.lab("Lg")
@@ -906,11 +974,14 @@ class Gen:
             w("ldi r16, 1")
             w("sts HBTRIP, r16")
             w("call apply_safe")
+            self.bb(2, 0)
             w(f"call h_{i}")
             w(f"{hb_no}:")
             w("lds r16, HBTRIP")
             w("tst r16")
             w(f"breq {hb_go}")
+            if self.steppers:
+                w("call r_steppers")
             w("jmp main_loop")
             w(f"{hb_go}:")
         for i, e in self.events:
@@ -948,6 +1019,26 @@ class Gen:
             w(f"{run}:")
             w(f"call h_{i}")
             w(f"{skip}:")
+        if self.need_mstep:
+            skip, plus, run = self.lab("Lt"), self.lab("Lt"), self.lab("Lt")
+            self.load("NOWC")
+            self.load("TMOT", 18)
+            w("call sub32")
+            self.cmp_ge(20, skip)
+            self.cmp_ge(40, plus)
+            self.load("NOWC")
+            self.store("TMOT")
+            w(f"jmp {run}")
+            w(f"{plus}:")
+            self.load("TMOT")
+            self.const(20, 18)
+            w("call add32")
+            self.store("TMOT")
+            w(f"{run}:")
+            w("call r_motors")
+            w(f"{skip}:")
+        if self.steppers:
+            w("call r_steppers")
         w("jmp main_loop")
 
     def clamp(self, lo, hi):
@@ -970,7 +1061,6 @@ class Gen:
 
     def hw_pwm(self, d, port, bit):
         n, w = d.name, self.w
-        timer, ocrh, ocrl, tccr, com = PWM_PINS[_pin(d.pin)]
         w(f"hw_{n}:")
         self.load(f"O_{n}")
         self.const(255, 18)
@@ -980,24 +1070,96 @@ class Gen:
         if d.invert:
             w("ldi r16, 255")
             w("eor r22, r16")
-        w("tst r22")
-        w(f"breq hw_{n}_0")
-        w("cpi r22, 255")
-        w(f"breq hw_{n}_f")
-        if ocrh:
-            w(f"sts {ocrh}, r2")
-        w(f"sts {ocrl}, r22")
-        w(f"lds r16, {tccr}")
-        w(f"ori r16, {com}")
-        w(f"sts {tccr}, r16")
-        w("ret")
-        for lab, op in (("0", "cbi"), ("f", "sbi")):
-            w(f"hw_{n}_{lab}:")
-            w(f"{op} {port}, {bit}")
+        w(f"jmp pwm_write_{_pin(d.pin)}")
+
+    def pwm_write_routines(self):
+        """pwm_write_<pin>: r22 = duty 0..255, with Arduino analogWrite semantics (0 and 255 are plain digital levels)."""
+        w = self.w
+        for pin in self.pwm_pins:
+            timer, ocrh, ocrl, tccr, com = PWM_PINS[pin]
+            port, _, bit = _port(pin)
+            w(f"pwm_write_{pin}:")
+            w("tst r22")
+            w(f"breq pw{pin}_0")
+            w("cpi r22, 255")
+            w(f"breq pw{pin}_f")
+            if ocrh:
+                w(f"sts {ocrh}, r2")
+            w(f"sts {ocrl}, r22")
             w(f"lds r16, {tccr}")
-            w(f"andi r16, {(~com) & 0xFF}")
+            w(f"ori r16, {com}")
             w(f"sts {tccr}, r16")
             w("ret")
+            for lab, op in (("0", "cbi"), ("f", "sbi")):
+                w(f"pw{pin}_{lab}:")
+                w(f"{op} {port}, {bit}")
+                w(f"lds r16, {tccr}")
+                w(f"andi r16, {(~com) & 0xFF}")
+                w(f"sts {tccr}, r16")
+                w("ret")
+
+    def all_out_pins(self):
+        pins = []
+        for d in self.outs:
+            ps = [_pin(p) for p in d.cfg["pins"].values()] if d.kind in ("motor", "stepper") else [_pin(d.pin)]
+            for p in ps:
+                if p not in pins:
+                    pins.append(p)
+        return pins
+
+    def bb(self, code, arg):
+        """Log to the black box (a no-op without one). The argument is a constant."""
+        if not self.bb_on:
+            return
+        self.const(arg)
+        self.w(f"ldi r16, {code}")
+        self.w("call bb_log")
+
+    def bb_A(self, code):
+        """Same, with the argument already in A (r22..r25)."""
+        if self.bb_on:
+            self.w(f"ldi r16, {code}")
+            self.w("call bb_log")
+
+    def hw_motor(self, d):
+        n, w, pins = d.name, self.w, d.cfg["pins"]
+        w(f"hw_{n}:")
+        self.load(f"CUR_{n}")
+        w("sbrs r25, 7")
+        w(f"rjmp hw_{n}_p")
+        w("call neg32")
+        w(f"hw_{n}_p:")
+        self.const(255, 18)
+        w("call mul32")
+        self.const(100, 18)
+        w("call divs32")
+        w("push r22")
+        if d.cfg["style"] == "dir":
+            port, _, bit = _port(_pin(pins["dir"]))
+            w(f"lds r16, CUR_{n}+3")
+            w("sbrc r16, 7")
+            w(f"rjmp hw_{n}_d0")
+            w(f"sbi {port}, {bit}")
+            w(f"rjmp hw_{n}_d")
+            w(f"hw_{n}_d0:")
+            w(f"cbi {port}, {bit}")
+            w(f"hw_{n}_d:")
+            w("pop r22")
+            w(f"jmp pwm_write_{_pin(pins['pwm'])}")
+        else:
+            fwd, rev = _pin(pins["fwd"]), _pin(pins["rev"])
+            w(f"lds r16, CUR_{n}+3")
+            w("sbrc r16, 7")
+            w(f"rjmp hw_{n}_r")
+            w("clr r22")
+            w(f"call pwm_write_{rev}")
+            w("pop r22")
+            w(f"jmp pwm_write_{fwd}")
+            w(f"hw_{n}_r:")
+            w("clr r22")
+            w(f"call pwm_write_{fwd}")
+            w("pop r22")
+            w(f"jmp pwm_write_{rev}")
 
     def hw_servo(self, d):
         n, w = d.name, self.w
@@ -1314,6 +1476,11 @@ class Gen:
                 w("call tx_i32")
                 w("call tx_crlf")
             cmd("STATE", state_cmd)
+        if self.bb_on:
+            def dump():
+                w("call rt_heard")
+                w("call bb_dump")
+            cmd("LOG", dump)
         seen = set()
         for i0, e0 in events:
             if e0.kind != "on" or e0.name in seen:
